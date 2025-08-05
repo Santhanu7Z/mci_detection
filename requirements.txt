@@ -1,0 +1,20 @@
+# Core ML/DL Frameworks
+torch
+transformers
+accelerate
+bitsandbytes
+
+# Mamba Implementation
+mamba-ssm
+causal-conv1d>=1.2.0
+
+# Audio Processing
+openai-whisper
+soundfile
+pydub
+ffmpeg-python
+
+# Data Handling & Utilities
+pandas
+scikit-learn
+tqdm
