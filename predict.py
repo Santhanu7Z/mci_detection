@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 import torch
 import torch.nn as nn
 import whisper
@@ -9,8 +10,8 @@ import json
 import random
 
 # --- SERVER-COMPATIBLE MAMBA IMPLEMENTATION ---
-# This section is an EXACT copy of the final, working train.py script's
-# model definitions to ensure perfect architectural alignment.
+# This section is an EXACT copy of the train.py script's model
+# definitions to ensure perfect architectural alignment.
 
 class InferredMambaConfig:
     def __init__(self, vocab_size, hidden_size, num_hidden_layers, d_inner, dt_rank, state_size, conv_kernel, num_labels=2):
@@ -126,14 +127,13 @@ def predict_mci(audio_path, whisper_model_size):
     print(f"\nTranscription: {transcription}\n")
 
     print("Loading fine-tuned Mamba model...")
-    # Load the tokenizer from the original source to ensure consistency
     tokenizer = AutoTokenizer.from_pretrained(TOKENIZER_ID)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
     
     # Instantiate the config with the known, correct values from our training run
     config = InferredMambaConfig(
-        vocab_size=50280, # True vocab size from the pre-trained model
+        vocab_size=50280, 
         hidden_size=768,
         num_hidden_layers=24,
         d_inner=1536,
@@ -146,7 +146,7 @@ def predict_mci(audio_path, whisper_model_size):
     # Instantiate the model with the correct architecture
     model = MambaForClassification(config)
     
-    # Load the fine-tuned weights, using your map_location suggestion for robustness
+    # Load the fine-tuned weights
     state_dict = torch.load(os.path.join(MODEL_PATH, "pytorch_model.bin"), map_location=device)
     model.load_state_dict(state_dict)
     model.to(device)
