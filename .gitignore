@@ -1,37 +1,24 @@
-# Byte-compiled / optimized / DLL files
-__pycache__/
-*.py[cod]
-*$py.class
-
-# Virtual environment
-mci_env/
-venv/
-env/
-ENV/
-.venv/
-
-# Jupyter Notebook checkpoints
-.ipynb_checkpoints/
-
-# Data folders (do not track large data)
+# Data and processed files
 data/
 processed_data/
+
+# Models
 trained_model/
 trained_model_mamba_pretrained/
 
-# OS files
-.DS_Store
-Thumbs.db
+# Virtual environments
+mci_env/
 
-# Logs and debug files
+# Jupyter checkpoints
+.ipynb_checkpoints/
+
+# Python cache
+__pycache__/
+*.pyc
+
+# Logs
 *.log
-debug_cha_parser.py
 
-# Python packaging
-*.egg-info/
-dist/
-build/
+# OS-specific files
+.DS_Store
 
-# Misc
-*.sqlite3
-*.db
