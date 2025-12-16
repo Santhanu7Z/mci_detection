@@ -1,27 +1,37 @@
+# ===============================
+# train.py — PERFORMANCE-OPTIMIZED (TARGET ≥70% F1)
+# Partial Unfreezing + Attention Pooling + Stable Training
+# ===============================
+
 import os
-import math
 import json
-import random
 import argparse
+import warnings
+from collections import Counter
+
+warnings.filterwarnings('ignore')
+os.environ['TOKENIZERS_PARALLELISM'] = 'false'
 
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
+from torch.cuda.amp import autocast, GradScaler
 import numpy as np
 import pandas as pd
-import whisper
 from sklearn.model_selection import train_test_split
-from sklearn.metrics import accuracy_score, f1_score
+from sklearn.metrics import accuracy_score, f1_score, classification_report, confusion_matrix
+from sklearn.utils.class_weight import compute_class_weight
 from tqdm import tqdm
 from huggingface_hub import hf_hub_download
 from transformers import AutoTokenizer
 
 # ------------------------------------------------------------
-# MAMBA WEIGHT-COMPATIBLE, SERVER-SAFE IMPLEMENTATION
+# MAMBA MODEL DEFINITIONS (STABLE)
 # ------------------------------------------------------------
 
 class InferredMambaConfig:
-    def __init__(self, vocab_size, hidden_size, num_hidden_layers, d_inner, dt_rank, state_size, conv_kernel, num_labels=2):
+    def __init__(self, vocab_size, hidden_size, num_hidden_layers,
+                 d_inner, dt_rank, state_size, conv_kernel, num_labels=2):
         self.vocab_size = vocab_size
         self.hidden_size = hidden_size
         self.num_hidden_layers = num_hidden_layers
@@ -31,420 +41,400 @@ class InferredMambaConfig:
         self.conv_kernel = conv_kernel
         self.num_labels = num_labels
 
+
 class MambaBlock(nn.Module):
-    def __init__(self, config: InferredMambaConfig):
+    def __init__(self, config):
         super().__init__()
-        self.config = config
         self.in_proj = nn.Linear(config.hidden_size, config.d_inner * 2, bias=False)
         self.conv1d = nn.Conv1d(
-            in_channels=config.d_inner,
-            out_channels=config.d_inner,
+            config.d_inner,
+            config.d_inner,
             kernel_size=config.conv_kernel,
-            bias=True,
             groups=config.d_inner,
             padding=config.conv_kernel - 1,
         )
         self.x_proj = nn.Linear(config.d_inner, config.dt_rank + config.state_size * 2, bias=False)
-        self.dt_proj = nn.Linear(config.dt_rank, config.d_inner, bias=True)
+        self.dt_proj = nn.Linear(config.dt_rank, config.d_inner)
         self.A_log = nn.Parameter(torch.zeros(config.d_inner, config.state_size))
-        self.D = nn.Parameter(torch.ones(config.d_inner))
         self.out_proj = nn.Linear(config.d_inner, config.hidden_size, bias=False)
 
     def forward(self, x):
-        b, l, d = x.shape
+        b, l, _ = x.shape
         xr = self.in_proj(x)
-        x, res = xr.split([self.config.d_inner, self.config.d_inner], dim=-1)
-        x = x.transpose(1, 2)
-        x = self.conv1d(x)[:, :, :l]
-        x = x.transpose(1, 2)
+        x, res = xr.chunk(2, dim=-1)
+        x = self.conv1d(x.transpose(1, 2))[:, :, :l].transpose(1, 2)
         x = torch.nn.functional.silu(x)
         x_dbl = self.x_proj(x)
-        dt, B, C = x_dbl.split([self.config.dt_rank, self.config.state_size, self.config.state_size], dim=-1)
+        dt, B, C = x_dbl.split([
+            self.dt_proj.in_features,
+            self.A_log.shape[1],
+            self.A_log.shape[1]], dim=-1)
         delta = torch.nn.functional.softplus(self.dt_proj(dt))
         A = -torch.exp(self.A_log.float())
-        y = self._selective_scan(x, delta, A, B, C)
-        y = y * torch.nn.functional.silu(res)
-        return self.out_proj(y)
+        with torch.no_grad():
+            y = self.scan(x, delta, A, B, C)
+        return self.out_proj(y * torch.nn.functional.silu(res))
 
-    def _selective_scan(self, u, delta, A, B, C):
-        b, l, d_in = u.shape
+    def scan(self, u, delta, A, B, C):
+        b, l, d = u.shape
         n = A.shape[1]
-        deltaA = torch.exp(delta.unsqueeze(-1) * A)
-        deltaB_u = (delta * u).unsqueeze(-1) * B.unsqueeze(2)
-        h = torch.zeros(b, d_in, n, device=u.device, dtype=u.dtype)
+        h = torch.zeros(b, d, n, device=u.device, dtype=u.dtype)
         ys = []
+        deltaA = torch.exp(delta.unsqueeze(-1) * A)
+        deltaBu = (delta * u).unsqueeze(-1) * B.unsqueeze(2)
         for i in range(l):
-            h = deltaA[:, i] * h + deltaB_u[:, i]
-            y = (h * C[:, i].unsqueeze(1)).sum(dim=-1)
-            ys.append(y)
+            h = deltaA[:, i] * h + deltaBu[:, i]
+            ys.append((h * C[:, i].unsqueeze(1)).sum(dim=-1))
         return torch.stack(ys, dim=1)
 
+
 class MambaResidualBlock(nn.Module):
-    def __init__(self, config: InferredMambaConfig):
+    def __init__(self, config):
         super().__init__()
-        self.mixer = MambaBlock(config)
         self.norm = nn.LayerNorm(config.hidden_size)
+        self.mixer = MambaBlock(config)
 
     def forward(self, x):
         return x + self.mixer(self.norm(x))
 
+
 class MambaBackbone(nn.Module):
-    def __init__(self, config: InferredMambaConfig):
+    def __init__(self, config):
         super().__init__()
         self.embedding = nn.Embedding(config.vocab_size, config.hidden_size)
-        self.layers = nn.ModuleList([MambaResidualBlock(config) for _ in range(config.num_hidden_layers)])
-        self.norm_f = nn.LayerNorm(config.hidden_size)
+        self.layers = nn.ModuleList([
+            MambaResidualBlock(config) for _ in range(config.num_hidden_layers)
+        ])
+        self.norm = nn.LayerNorm(config.hidden_size)
 
     def forward(self, input_ids):
         x = self.embedding(input_ids)
         for layer in self.layers:
             x = layer(x)
-        return self.norm_f(x)
+        return self.norm(x)
 
-class MambaForClassification(nn.Module):
-    def __init__(self, config: InferredMambaConfig):
+
+class AttentionPooling(nn.Module):
+    def __init__(self, hidden_size):
+        super().__init__()
+        self.attn = nn.Linear(hidden_size, 1)
+
+    def forward(self, x):
+        w = torch.softmax(self.attn(x), dim=1)
+        return (x * w).sum(dim=1)
+
+
+class MambaClassifier(nn.Module):
+    def __init__(self, config, class_weights):
         super().__init__()
         self.backbone = MambaBackbone(config)
-        self.classifier = nn.Linear(config.hidden_size, config.num_labels)
-        # Using CrossEntropyLoss here to allow validation loss calculation
-        self.criterion = nn.CrossEntropyLoss()
+        self.pool = AttentionPooling(config.hidden_size)
+        self.fc = nn.Linear(config.hidden_size, config.hidden_size // 4)
+        self.classifier = nn.Linear(config.hidden_size // 4, config.num_labels)
+        self.dropout = nn.Dropout(0.3)
+        self.criterion = nn.CrossEntropyLoss(weight=class_weights, label_smoothing=0.1)
 
     def forward(self, input_ids, labels=None):
         x = self.backbone(input_ids)
-        # Get the feature vector for the last token (classification head input)
-        # x[:, -1, :] effectively acts as a sequence-level representation (like the CLS token in BERT)
-        logits = self.classifier(x[:, -1, :])
-        loss = None
-        if labels is not None:
-            loss = self.criterion(logits, labels)
-        return type("Output", (), {"loss": loss, "logits": logits})
-
-# ------------------------------------------------------------
-# Utilities - CONFIG INFERRAL, DATA LOADING, AND EARLY STOPPER
-# ------------------------------------------------------------
-
-class EarlyStopper:
-    def __init__(self, patience=3, min_delta=0, mode='min'):
-        self.patience = patience
-        self.min_delta = min_delta
-        self.mode = mode
-        self.counter = 0
-        self.best_score = None
-        self.early_stop = False
-        
-        if self.mode == 'min':
-            self.best_score = float('inf')
-        elif self.mode == 'max':
-            self.best_score = float('-inf')
-
-    def __call__(self, current_score, model_state, model_path):
-        """
-        Check if training should stop.
-        Saves the best model based on the metric.
-        """
-        if self.best_score is None:
-            self.best_score = current_score
-            self.save_checkpoint(model_state, model_path)
-        elif (self.mode == 'min' and current_score > self.best_score + self.min_delta) or \
-             (self.mode == 'max' and current_score < self.best_score - self.min_delta):
-            self.counter += 1
-            print(f'EarlyStopper counter: {self.counter} out of {self.patience}')
-            if self.counter >= self.patience:
-                self.early_stop = True
-        else:
-            if (self.mode == 'min' and current_score < self.best_score) or \
-               (self.mode == 'max' and current_score > self.best_score):
-                self.best_score = current_score
-                self.save_checkpoint(model_state, model_path)
-            self.counter = 0
-        return self.early_stop
-
-    def save_checkpoint(self, model_state, model_path):
-        """Saves model when the metric improves."""
-        print(f"Validation score improved ({self.best_score:.4f}). Saving model to {model_path}...")
-        torch.save(model_state, model_path)
+        pooled = self.pool(x)
+        x = self.dropout(torch.nn.functional.gelu(self.fc(pooled)))
+        logits = self.classifier(x)
+        loss = self.criterion(logits, labels) if labels is not None else None
+        return loss, logits
 
 
-def infer_config_from_state_dict(sd: dict) -> InferredMambaConfig:
-    emb_w = sd.get('backbone.embedding.weight', None)
-    if emb_w is None:
-        raise ValueError("Checkpoint missing 'backbone.embedding.weight'.")
-    vocab_size, hidden_size = emb_w.shape
-
-    layer_idx = 0
-    while f'backbone.layers.{layer_idx}.mixer.in_proj.weight' in sd:
-        layer_idx += 1
-    num_hidden_layers = layer_idx
-
-    in_proj = sd['backbone.layers.0.mixer.in_proj.weight']
-    d_inner = in_proj.shape[0] // 2
-
-    dt_proj_w = sd['backbone.layers.0.mixer.dt_proj.weight']
-    dt_rank = dt_proj_w.shape[1]
-
-    x_proj_w = sd['backbone.layers.0.mixer.x_proj.weight']
-    total_out = x_proj_w.shape[0]
-    state_size = (total_out - dt_rank) // 2
-
-    conv_w = sd['backbone.layers.0.mixer.conv1d.weight']
-    conv_kernel = conv_w.shape[-1]
-
-    return InferredMambaConfig(
-        vocab_size=vocab_size,
-        hidden_size=hidden_size,
-        num_hidden_layers=num_hidden_layers,
-        d_inner=d_inner,
-        dt_rank=dt_rank,
-        state_size=state_size,
-        conv_kernel=conv_kernel,
-        num_labels=2,
-    )
-
-
-def load_and_transcribe_data(metadata_path, whisper_model_size, device):
-    print("Loading metadata...")
-    df = pd.read_csv(metadata_path)
-    
-    print(f"Loading Whisper model: {whisper_model_size}...")
-    
-    # Always load to CPU first for safety on shared memory systems
-    whisper_model = whisper.load_model(whisper_model_size, device="cpu")
-    
-    # Move Whisper to the actual compute device after loading
-    whisper_model.to(device)
-    
-    # --- ADDED VERBATIM TRANSCRIPTION PROMPT FOR LINGUISTIC FEATURES ---
-    # This prompt forces Whisper to keep fillers (um, uh) and disfluencies, 
-    # which are critical features of cognitive impairment.
-    VERBATIM_PROMPT = "The following is a verbatim transcript containing stutters, fillers like um and uh, false starts, and repetitions."
-        
-    transcriptions = []
-    print("Transcribing audio files with anti-hallucination and **VERBATIM** settings...")
-    
-    for audio_path in tqdm(df['audio_path'], desc="Transcribing"):
-        if not os.path.exists(audio_path):
-            transcriptions.append("")
-            continue
-        
-        # Apply robust constraints, using fp16 only if the device is CUDA
-        result = whisper_model.transcribe(
-            audio_path, 
-            fp16=(device == 'cuda'),
-            temperature=0.0, 
-            condition_on_previous_text=False,
-            initial_prompt=VERBATIM_PROMPT, # <- NEW: Forces Whisper to keep disfluencies
-            best_of=5,
-            beam_size=5,
-            patience=1.0,
-            no_speech_threshold=0.6,
-            logprob_threshold=-1.0
-        )
-        
-        transcriptions.append(result['text'])
-        
-    df['transcription'] = transcriptions
-    df = df[df['transcription'].str.strip() != ''].reset_index(drop=True)
-
-    # Note: We skip the caching fix for now, but this is where it would be implemented.
-    
-    return df
-
-class MCIDataset(torch.utils.data.Dataset):
+class SimpleDataset(torch.utils.data.Dataset):
     def __init__(self, encodings, labels):
         self.encodings = encodings
         self.labels = labels
+
     def __getitem__(self, idx):
-        item = {key: torch.tensor(val[idx]) for key, val in self.encodings.items()}
+        item = {k: torch.tensor(v[idx]) for k, v in self.encodings.items()}
         item['labels'] = torch.tensor(self.labels[idx])
         return item
+
     def __len__(self):
-        return len(self.encodings['input_ids'])
+        return len(self.labels)
+
 
 # ------------------------------------------------------------
-# Evaluation Function
+# UTILITIES
 # ------------------------------------------------------------
 
-def evaluate(model, data_loader, device):
-    """Calculates loss, accuracy, and F1 score on a given dataset."""
+def infer_config(sd):
+    emb = sd['backbone.embedding.weight']
+    vocab, hidden = emb.shape
+    layers = 0
+    while f'backbone.layers.{layers}.mixer.in_proj.weight' in sd:
+        layers += 1
+    in_proj = sd['backbone.layers.0.mixer.in_proj.weight']
+    d_inner = in_proj.shape[0] // 2
+    dt_rank = sd['backbone.layers.0.mixer.dt_proj.weight'].shape[1]
+    total = sd['backbone.layers.0.mixer.x_proj.weight'].shape[0]
+    state = (total - dt_rank) // 2
+    kernel = sd['backbone.layers.0.mixer.conv1d.weight'].shape[-1]
+    return InferredMambaConfig(vocab, hidden, layers, d_inner, dt_rank, state, kernel)
+
+
+def evaluate(model, loader, device):
     model.eval()
-    total_loss = 0.0
-    all_preds, all_labels = [], []
-    
+    losses, preds, labels = [], [], []
     with torch.no_grad():
-        for batch in tqdm(data_loader, desc="Evaluating"):
-            input_ids = batch['input_ids'].to(device)
-            labels = batch['labels'].to(device)
-            
-            # The model is now guaranteed to return a loss if labels are provided
-            out = model(input_ids=input_ids, labels=labels)
-            
-            total_loss += out.loss.item()
-            preds = torch.argmax(out.logits, dim=1)
-            
-            all_preds.extend(preds.cpu().numpy())
-            all_labels.extend(labels.cpu().numpy())
-            
-    avg_loss = total_loss / max(1, len(data_loader))
-    acc = accuracy_score(all_labels, all_preds)
-    f1 = f1_score(all_labels, all_preds, average='weighted') # Corrected: f1 calculation bug fix
-    
-    return avg_loss, acc, f1
+        for batch in loader:
+            ids = batch['input_ids'].to(device)
+            y = batch['labels'].to(device)
+            with autocast():
+                loss, logits = model(ids, y)
+            losses.append(loss.item())
+            preds.extend(logits.argmax(1).cpu().numpy())
+            labels.extend(y.cpu().numpy())
+    return float(np.mean(losses)), accuracy_score(labels, preds), f1_score(labels, preds, average='weighted'), labels, preds
+
 
 # ------------------------------------------------------------
-# Main training
+# TRAINING PIPELINE
 # ------------------------------------------------------------
 
 def main(args):
-    torch.manual_seed(args.seed)
-    np.random.seed(args.seed)
-    random.seed(args.seed)
-
-    PROCESSED_DATA_PATH = "processed_data/metadata.csv"
-    MODEL_OUTPUT_DIR = "trained_model_mamba_pretrained"
-    TOKENIZER_ID = "EleutherAI/gpt-neox-20b"
-    BEST_MODEL_PATH = os.path.join(MODEL_OUTPUT_DIR, "best_pytorch_model.bin")
-
-    # --- Initial Device Check ---
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    print(f"Using device: {device}")
+    device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    print(f"\n{'='*70}")
+    print(f"TRAINING CONFIGURATION")
+    print(f"{'='*70}")
+    print(f"Device: {device}")
     if device == 'cuda':
-        print(f"CUDA Device Name: {torch.cuda.get_device_name(0)}")
+        print(f"GPU: {torch.cuda.get_device_name(0)}")
+    print(f"Epochs: {args.epochs}")
+    print(f"Batch size: {args.batch_size}")
+    print(f"Accumulation steps: {args.acc_steps}")
+    print(f"Learning rate: {args.lr}")
+    print(f"Max sequence length: 384")
+    print(f"{'='*70}\n")
 
-    # Data loading uses the determined device. Transcription now uses VERBATIM prompt.
-    df = load_and_transcribe_data(PROCESSED_DATA_PATH, args.whisper_model, device)
-    
-    df['label_id'] = df['label'].apply(lambda x: 1 if x == 'Dementia' else 0)
-    
-    # Split: Train (80%) -> Remaining (20%)
-    train_df, remaining_df = train_test_split(df, test_size=0.2, random_state=args.seed, stratify=df['label_id'])
-    
-    # Split: Remaining (10% of total) -> Validation (50% of remaining), Test (50% of remaining)
-    val_df, test_df = train_test_split(remaining_df, test_size=0.5, random_state=args.seed, stratify=remaining_df['label_id'])
+    # FIXED: Use correct directory name to match predict.py
+    OUTPUT_DIR = 'trained_model_mamba_pretrained'
+    BEST_PATH = os.path.join(OUTPUT_DIR, 'best_pytorch_model.bin')
+    HISTORY_PATH = os.path.join(OUTPUT_DIR, 'training_history.json')
+    CONFIG_PATH = os.path.join(OUTPUT_DIR, 'config.json')
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
 
-    print(f"Data Split - Train: {len(train_df)}, Validation: {len(val_df)}, Test: {len(test_df)}")
-    
-    print(f"Loading tokenizer: {TOKENIZER_ID}...")
-    tokenizer = AutoTokenizer.from_pretrained(TOKENIZER_ID)
-    if tokenizer.pad_token is None:
-        tokenizer.pad_token = tokenizer.eos_token
+    # -------- Load data --------
+    print("Loading data and transcripts...")
+    df = pd.read_csv('processed_data/metadata.csv')
+    with open('processed_data/transcripts_cache.json') as f:
+        cache = json.load(f)
+    df['transcription'] = df['audio_path'].map(cache['transcripts'])
+    df = df[df['transcription'].str.strip() != '']
+    df['label_id'] = (df['label'] == 'Dementia').astype(int)
+
+    print(f"\nClass distribution:")
+    print(df['label'].value_counts())
+
+    train_df, test_df = train_test_split(df, test_size=0.15, stratify=df['label_id'], random_state=args.seed)
+    train_df, val_df = train_test_split(train_df, test_size=0.10, stratify=train_df['label_id'], random_state=args.seed)
+
+    print(f"\nData splits:")
+    print(f"  Train: {len(train_df)}")
+    print(f"  Val:   {len(val_df)}")
+    print(f"  Test:  {len(test_df)}\n")
+
+    tokenizer = AutoTokenizer.from_pretrained('EleutherAI/gpt-neox-20b')
+    tokenizer.pad_token = tokenizer.eos_token
+
+    MAX_LEN = 384
+    encode = lambda x: tokenizer(x.tolist(), truncation=True, padding='max_length', max_length=MAX_LEN)
 
     print("Tokenizing datasets...")
-    max_length = 2048
-    train_encodings = tokenizer(train_df['transcription'].tolist(), truncation=True, padding=True, max_length=max_length)
-    val_encodings = tokenizer(val_df['transcription'].tolist(), truncation=True, padding=True, max_length=max_length)
-    test_encodings = tokenizer(test_df['transcription'].tolist(), truncation=True, padding=True, max_length=max_length)
+    train_ds = SimpleDataset(encode(train_df.transcription), train_df.label_id.tolist())
+    val_ds = SimpleDataset(encode(val_df.transcription), val_df.label_id.tolist())
+    test_ds = SimpleDataset(encode(test_df.transcription), test_df.label_id.tolist())
 
-    train_dataset = MCIDataset(train_encodings, train_df['label_id'].tolist())
-    val_dataset = MCIDataset(val_encodings, val_df['label_id'].tolist())
-    test_dataset = MCIDataset(test_encodings, test_df['label_id'].tolist())
+    train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True)
+    val_loader = DataLoader(val_ds, batch_size=args.batch_size * 2)
+    test_loader = DataLoader(test_ds, batch_size=args.batch_size * 2)
 
-    train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True)
-    val_loader = DataLoader(val_dataset, batch_size=args.batch_size)
-    test_loader = DataLoader(test_dataset, batch_size=args.batch_size)
+    class_weights = torch.tensor(
+        compute_class_weight('balanced', classes=np.array([0, 1]), y=train_df.label_id.values),
+        device=device, dtype=torch.float
+    )
+    print(f"Class weights: Control={class_weights[0]:.4f}, Dementia={class_weights[1]:.4f}\n")
 
-    print(f"Downloading pre-trained weights from {args.mamba_model}...")
-    model_weights_path = hf_hub_download(repo_id=args.mamba_model, filename="pytorch_model.bin")
-    pretrained_weights = torch.load(model_weights_path, map_location="cpu")
+    # -------- Model --------
+    print(f"Loading pretrained Mamba weights from {args.mamba_model}...")
+    sd = torch.load(hf_hub_download(args.mamba_model, 'pytorch_model.bin'), map_location='cpu')
+    config = infer_config(sd)
 
-    config = infer_config_from_state_dict(pretrained_weights)
-    print(f"Inferred config -> hidden_size: {config.hidden_size}, layers: {config.num_hidden_layers}, d_inner: {config.d_inner}, dt_rank: {config.dt_rank}, state_size: {config.state_size}, conv_kernel: {config.conv_kernel}")
+    # Save config for predict.py
+    config_dict = {
+        'vocab_size': config.vocab_size,
+        'hidden_size': config.hidden_size,
+        'num_hidden_layers': config.num_hidden_layers,
+        'd_inner': config.d_inner,
+        'dt_rank': config.dt_rank,
+        'state_size': config.state_size,
+        'conv_kernel': config.conv_kernel,
+        'num_labels': config.num_labels,
+        'max_length': MAX_LEN,
+        'model_type': 'MambaClassifier'
+    }
+    with open(CONFIG_PATH, 'w') as f:
+        json.dump(config_dict, f, indent=2)
 
-    print("Initializing Mamba-like architecture (server-safe)...")
-    model = MambaForClassification(config)
+    model = MambaClassifier(config, class_weights).to(device)
+    model.load_state_dict({k: v for k, v in sd.items() if k.startswith('backbone.')}, strict=False)
 
-    missing, unexpected = model.load_state_dict(pretrained_weights, strict=False)
-    print(f"Weights loaded with {len(missing)} missing and {len(unexpected)} unexpected keys.")
+    # Freeze all, unfreeze last 2 layers
+    print("Freezing backbone (except last 2 layers)...")
+    for p in model.backbone.parameters():
+        p.requires_grad = False
+    for layer in model.backbone.layers[-2:]:
+        for p in layer.parameters():
+            p.requires_grad = True
 
-    # Move Mamba model to device
-    model.to(device)
+    trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    total = sum(p.numel() for p in model.parameters())
+    print(f"Trainable parameters: {trainable:,} / {total:,} ({100*trainable/total:.1f}%)\n")
 
-    optimizer = torch.optim.AdamW(model.parameters(), lr=5e-5)
+    optimizer = torch.optim.AdamW([
+        {'params': model.backbone.layers[-2:].parameters(), 'lr': 1e-4},
+        {'params': model.fc.parameters(), 'lr': args.lr},
+        {'params': model.classifier.parameters(), 'lr': args.lr},
+    ], weight_decay=0.01)
+
+    scaler = GradScaler(enabled=(device == 'cuda'))
+
+    # History tracking
+    history = {
+        'train_loss': [],
+        'train_accuracy': [],
+        'train_f1': [],
+        'val_loss': [],
+        'val_accuracy': [],
+        'val_f1': []
+    }
+
+    best_val_f1 = -1.0
+    patience = 5
+    patience_counter = 0
+
+    # -------- Training --------
+    print("Starting training...\n")
     
-    # Initialize Early Stopper
-    # patience=3, mode='min' for validation loss
-    early_stopper = EarlyStopper(patience=3, min_delta=0, mode='min') 
-
-    history = {'train_loss': [], 'val_loss': [], 'val_accuracy': [], 'val_f1': []}
-
-    print("Starting training...")
-    os.makedirs(MODEL_OUTPUT_DIR, exist_ok=True) # Ensure output dir exists before training
-
     for epoch in range(args.epochs):
-        # --- Training Step ---
         model.train()
-        total_train_loss = 0.0
-        pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{args.epochs} (Train)")
-        
-        for batch in pbar:
-            optimizer.zero_grad()
-            input_ids = batch['input_ids'].to(device)
-            labels = batch['labels'].to(device)
-            out = model(input_ids=input_ids, labels=labels)
-            loss = out.loss
-            loss.backward()
-            optimizer.step()
-            
-            total_train_loss += loss.item()
-            pbar.set_postfix({'loss': f'{loss.item():.4f}'})
-            
-        avg_train_loss = total_train_loss / max(1, len(train_loader))
-        history['train_loss'].append(avg_train_loss)
-        print(f"\nEpoch {epoch+1} Average Training Loss: {avg_train_loss:.4f}")
+        train_preds, train_labels, train_losses = [], [], []
+        optimizer.zero_grad()
 
-        # --- Validation Step ---
-        val_loss, val_acc, val_f1 = evaluate(model, val_loader, device)
+        pbar = tqdm(train_loader, desc=f'Epoch {epoch+1}/{args.epochs}')
+        for i, batch in enumerate(pbar):
+            ids = batch['input_ids'].to(device)
+            y = batch['labels'].to(device)
+
+            with autocast():
+                loss, logits = model(ids, y)
+                loss = loss / args.acc_steps
+
+            scaler.scale(loss).backward()
+
+            if (i + 1) % args.acc_steps == 0:
+                scaler.step(optimizer)
+                scaler.update()
+                optimizer.zero_grad()
+
+            train_losses.append(loss.item() * args.acc_steps)
+            train_preds.extend(logits.argmax(1).detach().cpu().numpy())
+            train_labels.extend(y.cpu().numpy())
+            
+            pbar.set_postfix({'loss': f'{loss.item() * args.acc_steps:.4f}'})
+
+        train_loss = float(np.mean(train_losses))
+        train_acc = accuracy_score(train_labels, train_preds)
+        train_f1 = f1_score(train_labels, train_preds, average='weighted')
+
+        val_loss, val_acc, val_f1, _, _ = evaluate(model, val_loader, device)
+
+        # Save to history
+        history['train_loss'].append(train_loss)
+        history['train_accuracy'].append(train_acc)
+        history['train_f1'].append(train_f1)
         history['val_loss'].append(val_loss)
         history['val_accuracy'].append(val_acc)
         history['val_f1'].append(val_f1)
-        
-        print(f"Epoch {epoch+1} - Validation Loss: {val_loss:.4f}, Accuracy: {val_acc:.4f}, F1 Score: {val_f1:.4f}")
 
-        # --- Early Stopping Check ---
-        if early_stopper(val_loss, model.state_dict(), BEST_MODEL_PATH):
-            print(f"Early stopping triggered at epoch {epoch+1} (patience={early_stopper.patience})")
+        print(f"\nEpoch {epoch+1}/{args.epochs}")
+        print(f"  TRAIN - Loss: {train_loss:.4f} | Acc: {train_acc:.3f} | F1: {train_f1:.3f}")
+        print(f"  VAL   - Loss: {val_loss:.4f} | Acc: {val_acc:.3f} | F1: {val_f1:.3f}")
+
+        # Save best model
+        if val_f1 > best_val_f1:
+            best_val_f1 = val_f1
+            torch.save(model.state_dict(), BEST_PATH)
+            print(f"  ✓ New best model saved (Val F1: {val_f1:.3f})")
+            patience_counter = 0
+        else:
+            patience_counter += 1
+            print(f"  Patience: {patience_counter}/{patience}")
+            
+        # Early stopping
+        if patience_counter >= patience:
+            print(f"\n⚠ Early stopping triggered at epoch {epoch+1}")
             break
+        
+        print()
 
-    # --- Final Evaluation and Save ---
+    # Save training history
+    with open(HISTORY_PATH, 'w') as f:
+        json.dump(history, f, indent=2)
+    print(f"Training history saved to {HISTORY_PATH}")
+
+    # -------- Final Test --------
+    print(f"\nLoading best model for final evaluation...")
+    model.load_state_dict(torch.load(BEST_PATH, map_location=device))
+    test_loss, test_acc, test_f1, test_labels, test_preds = evaluate(model, test_loader, device)
+
+    print(f"\n{'='*70}")
+    print(f"FINAL TEST RESULTS")
+    print(f"{'='*70}")
+    print(f"Loss: {test_loss:.4f} | Accuracy: {test_acc:.3f} | F1 Score: {test_f1:.3f}")
+    print(f"{'='*70}\n")
+
+    print("Classification Report (Test Set):")
+    print(classification_report(test_labels, test_preds, target_names=['Control', 'Dementia']))
+
+    print("\nConfusion Matrix:")
+    cm = confusion_matrix(test_labels, test_preds)
+    print(f"              Predicted")
+    print(f"            Control  Dementia")
+    print(f"Control       {cm[0][0]:3d}      {cm[0][1]:3d}")
+    print(f"Dementia      {cm[1][0]:3d}      {cm[1][1]:3d}\n")
+
+    # Save final results
+    results = {
+        'test_loss': float(test_loss),
+        'test_accuracy': float(test_acc),
+        'test_f1': float(test_f1),
+        'best_val_f1': float(best_val_f1),
+        'confusion_matrix': cm.tolist()
+    }
     
-    # Load the best model weights found during training
-    if os.path.exists(BEST_MODEL_PATH):
-        print(f"Loading best model from {BEST_MODEL_PATH} for final evaluation.")
-        model.load_state_dict(torch.load(BEST_MODEL_PATH, map_location=device))
-        
-        # Run final evaluation on the separate test set
-        test_loss, test_acc, test_f1 = evaluate(model, test_loader, device)
-        print("----------------------------------------------------------------------")
-        print(f"FINAL TEST RESULTS (Best Model):")
-        print(f"Loss: {test_loss:.4f}, Accuracy: {test_acc:.4f}, F1 Score: {test_f1:.4f}")
-        print("----------------------------------------------------------------------")
+    with open(os.path.join(OUTPUT_DIR, 'test_results.json'), 'w') as f:
+        json.dump(results, f, indent=2)
 
-        # Save tokenizer and history for the best model
-        tokenizer.save_pretrained(MODEL_OUTPUT_DIR)
-        
-    else:
-        # If early stopping was never triggered (e.g., training finished all epochs), 
-        # save the last epoch's model and evaluate it on the test set.
-        print(f"Training complete. Saving final model weights to {MODEL_OUTPUT_DIR}")
-        torch.save(model.state_dict(), os.path.join(MODEL_OUTPUT_DIR, "pytorch_model.bin"))
-        tokenizer.save_pretrained(MODEL_OUTPUT_DIR)
-        test_loss, test_acc, test_f1 = evaluate(model, test_loader, device)
-        print("----------------------------------------------------------------------")
-        print(f"FINAL TEST RESULTS (Last Epoch Model):")
-        print(f"Loss: {test_loss:.4f}, Accuracy: {test_acc:.4f}, F1 Score: {test_f1:.4f}")
-        print("----------------------------------------------------------------------")
+    tokenizer.save_pretrained(OUTPUT_DIR)
+    print(f"All files saved to {OUTPUT_DIR}/")
+    print(f"  ✓ best_pytorch_model.bin")
+    print(f"  ✓ training_history.json")
+    print(f"  ✓ config.json")
+    print(f"  ✓ test_results.json")
+    print(f"  ✓ tokenizer files\n")
 
-    history_path = os.path.join(MODEL_OUTPUT_DIR, 'training_history.json')
-    with open(history_path, 'w') as f:
-        # Convert NumPy types in history to standard Python types for JSON serialization
-        json.dump({k: [float(x) for x in v] for k, v in history.items()}, f, indent=4)
-    print(f"Training history saved to {history_path}")
 
 if __name__ == '__main__':
-    parser = argparse.ArgumentParser(description="Train a GLIBC-safe Mamba-like classifier for MCI detection.")
-    parser.add_argument('--epochs', type=int, default=10, help='Number of training epochs.')
-    parser.add_argument('--batch_size', type=int, default=4, help='Training and evaluation batch size.') 
-    parser.add_argument('--whisper_model', type=str, default='medium.en', help='Whisper model size.')
-    parser.add_argument('--mamba_model', type=str, default='state-spaces/mamba-130m', help='HF repo id for weights.')
-    parser.add_argument('--seed', type=int, default=42, help='Random seed for reproducibility.')
-    args = parser.parse_args()
+    p = argparse.ArgumentParser()
+    p.add_argument('--epochs', type=int, default=15)
+    p.add_argument('--batch_size', type=int, default=8)
+    p.add_argument('--acc_steps', type=int, default=4)
+    p.add_argument('--lr', type=float, default=5e-4)
+    p.add_argument('--seed', type=int, default=42)
+    p.add_argument('--mamba_model', type=str, default='state-spaces/mamba-130m')
+    args = p.parse_args()
     main(args)
