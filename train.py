@@ -4,6 +4,7 @@
 # ============================================================
 
 import os
+os.environ['MAMBA_NO_TRITON'] = '1'  # Disable Triton, use pure CUDA
 import json
 import argparse
 import random
