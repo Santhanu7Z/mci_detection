@@ -53,35 +53,39 @@ class MCIFusionDataset(Dataset):
         }
 
 # ============================================================
-# ARCHITECTURE: Attention-Based Fusion (Statistically Scaled)
+# ARCHITECTURE: Gated Multimodal Fusion (Statistically Robust)
 # ============================================================
 
-class AttentionFusionBlock(nn.Module):
-    def __init__(self, embed_dim=256, num_heads=4):
+class GatedFusion(nn.Module):
+    """
+    Replaces Multi-Head Attention with a Gating Mechanism.
+    Learns exactly how much to trust the Audio vs the Text.
+    """
+    def __init__(self, dim=256):
         super().__init__()
-        # 2 tokens (Text, Audio) is small; we keep dropout healthy at 0.3
-        self.mha = nn.MultiheadAttention(embed_dim, num_heads, dropout=0.3, batch_first=True)
-        self.layernorm = nn.LayerNorm(embed_dim)
-        self.ffn = nn.Sequential(
-            nn.Linear(embed_dim, embed_dim * 2),
+        # The gate learns a value between 0 and 1 for the audio stream
+        self.gate = nn.Sequential(
+            nn.Linear(dim * 2, dim),
             nn.GELU(),
-            nn.Dropout(0.3),
-            nn.Linear(embed_dim * 2, embed_dim)
+            nn.Linear(dim, 1),
+            nn.Sigmoid()
         )
 
-    def forward(self, x):
-        attn_out, weights = self.mha(x, x, x)
-        x = self.layernorm(x + attn_out)
-        x = self.layernorm(x + self.ffn(x))
-        return x, weights
+    def forward(self, text_emb, audio_emb):
+        # Calculate how much to trust audio based on both modalities
+        combined = torch.cat([text_emb, audio_emb], dim=-1)
+        audio_weight = self.gate(combined) # [B, 1]
+        
+        # Apply the gate to audio, keep text as the primary anchor
+        fused = text_emb + (audio_weight * audio_emb)
+        return fused, audio_weight
 
-class MambaAttentionFusion(nn.Module):
+class MambaGatedFusion(nn.Module):
     def __init__(self, mamba_model, acoustic_dim, num_labels, freeze_backbone=True):
         super().__init__()
         self.mamba = mamba_model.backbone
         
-        # --- SCIENTIFIC MANDATE: FREEZE BACKBONE ---
-        # Solving the Bias-Variance problem for N=544 samples
+        # 100% Freeze Backbone to prevent Representation Drift (N=544)
         if freeze_backbone:
             for param in self.mamba.parameters():
                 param.requires_grad = False
@@ -89,7 +93,6 @@ class MambaAttentionFusion(nn.Module):
         text_dim = mamba_model.config.d_model # 768
         fusion_dim = 256 
 
-        # Projections to shared space
         self.text_proj = nn.Sequential(
             nn.Linear(text_dim, fusion_dim),
             nn.LayerNorm(fusion_dim),
@@ -103,42 +106,36 @@ class MambaAttentionFusion(nn.Module):
             nn.GELU()
         )
 
-        self.fusion_block = AttentionFusionBlock(embed_dim=fusion_dim)
+        self.fusion_layer = GatedFusion(dim=fusion_dim)
 
         self.classifier = nn.Sequential(
-            nn.Linear(fusion_dim * 2, 128),
+            nn.Linear(fusion_dim, 128),
             nn.GELU(),
-            nn.Dropout(0.35), # Balanced dropout
+            nn.Dropout(0.3),
             nn.Linear(128, num_labels)
         )
 
         self.criterion = nn.CrossEntropyLoss(label_smoothing=0.1)
 
     def forward(self, input_ids, acoustic_features, labels=None):
-        # 1. Extract Text Features (Deterministic with torch.no_grad if frozen)
-        # Using a guard to allow training if needed, but defaulting to no_grad for speed/stability
-        backbone_grad = any(p.requires_grad for p in self.mamba.parameters())
-        with torch.set_grad_enabled(backbone_grad):
+        # 1. Feature Extraction (No-grad for efficiency)
+        with torch.no_grad():
             text_out = self.mamba(input_ids).mean(dim=1) 
         
-        text_proj = self.text_proj(text_out)
-        audio_proj = self.audio_proj(acoustic_features)
+        text_emb = self.text_proj(text_out)
+        audio_emb = self.audio_proj(acoustic_features)
 
-        # 2. Sequence for Attention: [Batch, Tokens=2, Dim=256]
-        combined = torch.stack([text_proj, audio_proj], dim=1)
-        
-        # 3. Dynamic Attention Fusion
-        fused_seq, attn_weights = self.fusion_block(combined)
+        # 2. Gated Fusion (Acoustic gate)
+        fused_features, gate_weights = self.fusion_layer(text_emb, audio_emb)
 
-        # 4. Concatenate Attended Tokens
-        fused_flat = fused_seq.view(fused_seq.size(0), -1) 
-        logits = self.classifier(fused_flat)
+        # 3. Final Classification
+        logits = self.classifier(fused_features)
 
         loss = self.criterion(logits, labels) if labels is not None else None
-        return loss, logits, attn_weights
+        return loss, logits, gate_weights
 
 # ============================================================
-# EVALUATION & UTILS
+# EVALUATION & MAIN
 # ============================================================
 
 @torch.no_grad()
@@ -154,17 +151,11 @@ def evaluate(model, loader, device):
         labels.extend(y.cpu().numpy())
     return np.mean(losses), accuracy_score(labels, preds), f1_score(labels, preds, average="weighted")
 
-# ============================================================
-# MAIN
-# ============================================================
-
 def main(args):
-    random.seed(args.seed)
-    np.random.seed(args.seed)
     torch.manual_seed(args.seed)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    # 1. Data Loading
+    # Load Data
     meta_df = pd.read_csv(os.path.join(DATA_DIR, "metadata.csv"))
     acoustic_df = pd.read_csv(os.path.join(DATA_DIR, "egemaps_features.csv"))
     with open(os.path.join(DATA_DIR, "transcripts_cache.json")) as f:
@@ -177,7 +168,7 @@ def main(args):
     feat_cols = [c for c in acoustic_df.columns if c not in ['participant_id', 'file_id', 'duration']]
     acoustic_data = df[feat_cols].values
 
-    # 2. Splits & Scaling
+    # Splits & Scaling
     indices = np.arange(len(df))
     tr_idx, te_idx = train_test_split(indices, test_size=0.15, stratify=df["label_id"], random_state=args.seed)
     tr_idx, va_idx = train_test_split(tr_idx, test_size=0.10, stratify=df.iloc[tr_idx]["label_id"], random_state=args.seed)
@@ -187,13 +178,12 @@ def main(args):
     acoustic_val = scaler.transform(acoustic_data[va_idx])
     acoustic_test = scaler.transform(acoustic_data[te_idx])
 
-    # 3. Setup Objects
+    # Dataloaders
     tokenizer = AutoTokenizer.from_pretrained("EleutherAI/gpt-neox-20b")
     tokenizer.pad_token = tokenizer.eos_token
     train_ds = MCIFusionDataset(df.iloc[tr_idx], tokenizer, acoustic_train)
     val_ds = MCIFusionDataset(df.iloc[va_idx], tokenizer, acoustic_val)
     test_ds = MCIFusionDataset(df.iloc[te_idx], tokenizer, acoustic_test)
-
     train_weights = compute_class_weight("balanced", classes=np.array([0, 1]), y=df.iloc[tr_idx]["label_id"].values)
     sampler = WeightedRandomSampler([train_weights[l] for l in df.iloc[tr_idx]["label_id"]], len(tr_idx))
 
@@ -201,53 +191,35 @@ def main(args):
     val_loader = DataLoader(val_ds, batch_size=args.batch_size * 2)
     test_loader = DataLoader(test_ds, batch_size=args.batch_size * 2)
 
-    # 4. Model & Optimization
-    print(f"Loading Mamba Backbone: {args.mamba_model}")
+    # Model
     base_mamba = MambaLMHeadModel.from_pretrained(args.mamba_model)
-    
-    model = MambaAttentionFusion(
-        base_mamba, 
-        acoustic_dim=len(feat_cols), 
-        num_labels=2, 
-        freeze_backbone=args.freeze_backbone
-    ).to(device)
+    model = MambaGatedFusion(base_mamba, acoustic_dim=len(feat_cols), num_labels=2).to(device)
 
-    # Only pass trainable parameters to optimizer
+    # Optimizer (Only trainable head params)
     trainable_params = [p for p in model.parameters() if p.requires_grad]
-    print(f"Total Trainable Parameters: {sum(p.numel() for p in trainable_params)}")
-
-    optimizer = torch.optim.AdamW(trainable_params, lr=args.lr, weight_decay=0.05)
-
-    # SWITCHED: CosineAnnealingLR (Standard) to prevent oscillations on small data
+    optimizer = torch.optim.AdamW(trainable_params, lr=args.lr, weight_decay=0.02)
+    
+    # SWITCHED: Standard CosineAnnealing (No restarts) for stability on tiny data
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs)
     scaler_gpu = GradScaler(enabled=(device.type == "cuda"))
-
-    # 5. Training with Gradient Accumulation
     best_f1 = 0
     patience_counter = 0
-    print(f"\n🚀 Starting Statistically Stable Fusion Training on {device}...")
+
+    print(f"\n🚀 Training Statistically Stable Gated Fusion on {device}...")
 
     for epoch in range(args.epochs):
         model.train()
-        train_losses = []
         pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}")
         optimizer.zero_grad()
-
         for i, batch in enumerate(pbar):
-            ids = batch["input_ids"].to(device)
-            acoustics = batch["acoustic_features"].to(device)
-            labels = batch["labels"].to(device)
-
+            ids, acoustics, labels = batch["input_ids"].to(device), batch["acoustic_features"].to(device), batch["labels"].to(device)
             with autocast(enabled=(device.type == "cuda")):
                 loss, _, _ = model(ids, acoustics, labels)
                 loss = loss / args.acc_steps
-
             scaler_gpu.scale(loss).backward()
-            train_losses.append(loss.item() * args.acc_steps)
-
             if (i + 1) % args.acc_steps == 0:
                 scaler_gpu.unscale_(optimizer)
-                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
                 scaler_gpu.step(optimizer)
                 scaler_gpu.update()
                 optimizer.zero_grad()
@@ -264,23 +236,21 @@ def main(args):
         else:
             patience_counter += 1
             if patience_counter >= args.patience:
-                print(f"Early stopping at epoch {epoch+1}")
+                print("Early stopping triggered.")
                 break
 
-    # 6. Final Test
-    print("\n--- Final Test Set Evaluation ---")
+    print("\n--- Final Test Evaluation ---")
     model.load_state_dict(torch.load(os.path.join(MODEL_DIR, "best_attention_fusion.bin")))
     _, test_acc, test_f1 = evaluate(model, test_loader, device)
     print(f"Final Accuracy: {test_acc:.4f} | Final F1: {test_f1:.4f}")
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--epochs", type=int, default=40)
+    parser.add_argument("--epochs", type=int, default=30)
     parser.add_argument("--batch_size", type=int, default=8)
     parser.add_argument("--acc_steps", type=int, default=4)
-    parser.add_argument("--lr", type=float, default=2e-4)
-    parser.add_argument("--patience", type=int, default=10)
+    parser.add_argument("--lr", type=float, default=2e-4) # Balanced LR
+    parser.add_argument("--patience", type=int, default=8)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--mamba_model", type=str, default="state-spaces/mamba-130m")
-    parser.add_argument("--freeze_backbone", type=bool, default=True)
     main(parser.parse_args())

@@ -1,24 +1,45 @@
-# Data and processed files
-data/
-processed_data/
-
-# Models
-trained_model/
-trained_model_mamba_pretrained/
-
-# Virtual environments
+# --- Python Environment ---
+.venv/
+venv/
+env/
 mci_env/
-
-# Jupyter checkpoints
-.ipynb_checkpoints/
-
-# Python cache
 __pycache__/
 *.pyc
+*.pyo
+*.pyd
 
-# Logs
+# --- Datasets and Raw Files ---
+data/
+processed_data/
+raw_data/
+*.cha
+*.wav
+*.mp3
+*.flac
+
+# --- Model Weights and Checkpoints (Heavy Files) ---
+trained_*/
+model_checkpoints/
+*.bin
+*.pth
+*.pt
+*.h5
+*.ckpt
+
+# --- Logs and Cluster Output ---
+logs/
 *.log
+*.out
+*.err
 
-# OS-specific files
+# --- IDE and OS Specific ---
+.ipynb_checkpoints/
+.vscode/
+.idea/
 .DS_Store
+*.swp
+*.swo
 
+# --- Ignore temporary/debug files ---
+debug_*/
+temp_*/

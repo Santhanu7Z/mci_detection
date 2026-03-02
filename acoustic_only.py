@@ -1,12 +1,11 @@
 # ============================================================
-# acoustic_only.py — STATISTICALLY CORRECT ACOUSTIC BASELINE
-# Designed for ~70+ dimensional clinical acoustic features
+# acoustic_only.py — eGeMAPS CLINICAL ACOUSTIC BASELINE
+# Leak-free, statistically correct, cluster-ready
 # ============================================================
 
 import os
 import argparse
 import random
-import json
 import joblib
 
 import numpy as np
@@ -25,10 +24,9 @@ from sklearn.utils.class_weight import compute_class_weight
 
 
 # ============================================================
-# Configuration
+# Config
 # ============================================================
 
-DATA_PATH = "processed_data/master_fusion_data.csv"
 MODEL_DIR = "trained_acoustic_baseline_model"
 os.makedirs(MODEL_DIR, exist_ok=True)
 
@@ -85,7 +83,6 @@ class AcousticClassifier(nn.Module):
             nn.Linear(64, num_labels)
         )
 
-        # No class weights here (sampler handles imbalance)
         self.criterion = nn.CrossEntropyLoss(label_smoothing=0.1)
 
     def forward(self, x, labels=None):
@@ -158,23 +155,43 @@ def main(args):
     print("Device:", device)
 
     # --------------------------------------------------------
-    # Load data
+    # Load metadata + eGeMAPS and merge
     # --------------------------------------------------------
 
-    df = pd.read_csv(DATA_PATH)
+    print("\nLoading metadata + eGeMAPS...")
 
-    y = df["label"].map({"Control": 0, "Dementia": 1}).values
-    X = df.drop(
-        columns=["participant_id", "file_id", "label",
-                 "transcription", "audio_path", "label_id"],
-        errors="ignore"
-    ).values
+    meta = pd.read_csv("processed_data/metadata.csv")
+    eg = pd.read_csv("processed_data/egemaps_features.csv")
+
+    # Fix ID mismatch
+    eg["participant_id"] = eg["file_id"].str.replace("_participant", "", regex=False)
+
+    df = meta.merge(eg, on="participant_id")
+
+    print("Metadata samples:", meta.shape[0])
+    print("eGeMAPS samples:", eg.shape[0])
+    print("Merged samples:", df.shape[0])
+
+    # Encode labels
+    df["label_id"] = df["label"].map({"Control": 0, "Dementia": 1})
+
+    # Drop non-feature columns
+    drop_cols = [
+        "participant_id",
+        "file_id",
+        "label",
+        "audio_path",
+        "label_id"
+    ]
+
+    X = df.drop(columns=[c for c in drop_cols if c in df.columns]).values
+    y = df["label_id"].values
 
     print("Total samples:", X.shape[0])
-    print("Feature dimension:", X.shape[1])
+    print("Feature dimension:", X.shape[1])  # Should be 88
 
     # --------------------------------------------------------
-    # Split FIRST (no leakage)
+    # Split FIRST (Leak-free)
     # --------------------------------------------------------
 
     X_train, X_test, y_train, y_test = train_test_split(
@@ -197,7 +214,7 @@ def main(args):
     joblib.dump(scaler, os.path.join(MODEL_DIR, "acoustic_scaler.pkl"))
 
     # --------------------------------------------------------
-    # Sampler (better than class weights alone)
+    # Weighted Sampler
     # --------------------------------------------------------
 
     class_weights = compute_class_weight(
@@ -252,11 +269,11 @@ def main(args):
     scaler_amp = GradScaler(enabled=(device.type == "cuda"))
     early_stopper = EarlyStopper(patience=args.patience)
 
-    # --------------------------------------------------------
-    # Training
-    # --------------------------------------------------------
-
     print("\nStarting acoustic training...\n")
+
+    # --------------------------------------------------------
+    # Training Loop
+    # --------------------------------------------------------
 
     for epoch in range(args.epochs):
 
@@ -314,7 +331,7 @@ def main(args):
     _, test_acc, test_f1, test_labels, test_preds = evaluate(model, test_loader, device)
 
     print("\n==================================================")
-    print("FINAL ACOUSTIC RESULTS (Leak-Free)")
+    print("FINAL eGeMAPS ACOUSTIC RESULTS (Leak-Free)")
     print("==================================================")
     print(f"F1 Score: {test_f1:.4f} | Accuracy: {test_acc:.4f}\n")
 
