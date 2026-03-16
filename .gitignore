@@ -43,3 +43,10 @@ logs/
 # --- Ignore temporary/debug files ---
 debug_*/
 temp_*/
+.venv/
+data/
+*.bin
+*.pt
+logs/
+__pycache__/
+.DS_Store

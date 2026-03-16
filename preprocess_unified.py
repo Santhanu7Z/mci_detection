@@ -1,24 +1,29 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Unified preprocessing for Pitt, ADReSS, and TAUKADIAL.
-Final TAUKADIAL Label Fix: Handles mixed delimiters (comma/semicolon) and varying column counts.
+Unified Preprocessing v4.2 - CLUSTER OPTIMIZED (Bulletproof Edition)
+- Participant-Only Audio Extraction (Segmentation).
+- Fix: Flexible TAUKADIAL Parser (handles both ',' and ';' delimiters).
+- Fix: Enhanced TAUKADIAL Metadata (captures Age, Sex/Gender, and MMSE).
+- Fix: TAUKADIAL Training Label Recovery (loads both train/test ground truth).
+- standardizes to 16kHz Mono (Whisper Optimized).
 """
 
 import argparse
-from pathlib import Path
-import re
 import os
+import re
+import json
+from pathlib import Path
 import pandas as pd
 from pydub import AudioSegment
 from tqdm import tqdm
 
 # ============================================================
-# COMMON AUDIO UTILITIES
+# AUDIO UTILITIES
 # ============================================================
 
 def standardize_audio(audio_segment):
-    """Standardize to 16kHz, Mono WAV."""
+    """Ensures 16kHz, Mono, 16-bit depth for Whisper optimization."""
     if audio_segment.channels > 1:
         audio_segment = audio_segment.set_channels(1)
     if audio_segment.frame_rate != 16000:
@@ -26,223 +31,292 @@ def standardize_audio(audio_segment):
     return audio_segment
 
 def save_processed_audio(audio_segment, output_path):
-    """Standardizes and saves audio; returns False if audio is < 500ms."""
+    """Standardizes and saves audio; returns False if audio is invalid."""
     audio_segment = standardize_audio(audio_segment)
     if len(audio_segment) < 500:
         return False
-    audio_segment.export(output_path, format='wav')
+    audio_segment.export(output_path, format="wav")
     return True
+
+# ============================================================
+# CHAT SEGMENTATION ENGINE
+# ============================================================
+
+def extract_par_segments_from_cha(cha_path):
+    """Parses CHAT files to find all timestamps belonging to the Participant (*PAR)."""
+    segments = []
+    par_pattern = re.compile(r"^\*PAR[^\:]*\s*:\s*(.*)", flags=re.IGNORECASE)
+    ts_pattern = re.compile(r"(\d+)_(\d+)")
+
+    try:
+        with open(cha_path, "r", encoding="utf-8-sig", errors="ignore") as f:
+            for line in f:
+                if par_pattern.match(line.strip()):
+                    timestamps = ts_pattern.findall(line)
+                    for start, end in timestamps:
+                        s, e = int(start), int(end)
+                        if e > s:
+                            segments.append((s, e))
+    except Exception as e:
+        print(f"Error parsing CHAT {cha_path}: {e}")
+    
+    if not segments: return []
+    
+    segments.sort()
+    merged = [segments[0]]
+    for curr in segments[1:]:
+        prev = merged[-1]
+        if curr[0] <= prev[1] + 100:
+            merged[-1] = (prev[0], max(prev[1], curr[1]))
+        else:
+            merged.append(curr)
+    return merged
+
+def segment_audio(audio_path, cha_path):
+    """Cuts audio to include ONLY participant segments."""
+    segments = extract_par_segments_from_cha(cha_path)
+    if not segments: return None
+
+    try:
+        ext = Path(audio_path).suffix.lower()
+        if ext == '.wav':
+            full_audio = AudioSegment.from_wav(audio_path)
+        elif ext == '.mp3':
+            full_audio = AudioSegment.from_mp3(audio_path)
+        else:
+            full_audio = AudioSegment.from_file(audio_path)
+
+        combined = AudioSegment.empty()
+        padding = 100 
+        
+        for i, (start, end) in enumerate(segments):
+            s_pad = max(0, start - padding)
+            e_pad = min(len(full_audio), end + padding)
+            combined += full_audio[s_pad:e_pad]
+            if i < len(segments) - 1:
+                combined += AudioSegment.silent(duration=100)
+            
+        return combined
+    except Exception as e:
+        print(f"Segmentation failed for {audio_path}: {e}")
+        return None
 
 # ============================================================
 # DATASET PROCESSORS
 # ============================================================
 
-def preprocess_dementiabank(output_base_dir):
-    print("\n" + "="*60 + "\nPREPROCESSING: DementiaBank (Pitt Corpus)\n" + "="*60)
-    DATA_DIR = Path("data/Pitt")
-    OUTPUT_DIR = Path(output_base_dir) / "dementiabank"
-    AUDIO_OUT = OUTPUT_DIR / "audio"
-    AUDIO_OUT.mkdir(parents=True, exist_ok=True)
-    
-    PAR_PATTERN = re.compile(r'^\*PAR[^\:]*\s*:\s*(.*)', flags=re.IGNORECASE)
-    TS_PATTERN = re.compile(r'(\d+)_(\d+)')
-    records = []
+def clean_df_headers(df):
+    """Aggressively strips whitespace and invisible chars from headers."""
+    df.columns = [str(c).strip() for c in df.columns]
+    return df
 
-    for group in ['Control', 'Dementia']:
-        group_folder = DATA_DIR / group
-        if not group_folder.exists(): continue
+def process_pitt(output_dir):
+    print("\nProcessing Pitt Corpus...")
+    records = []
+    data_dir = Path("data/Pitt")
+    out_audio = Path(output_dir) / "pitt_segmented"
+    out_audio.mkdir(parents=True, exist_ok=True)
+
+    for group in ["Control", "Dementia"]:
+        group_dir = data_dir / group
+        if not group_dir.exists(): continue
         
-        cha_files = sorted(list(group_folder.glob('*.cha')))
-        for cha_path in tqdm(cha_files, desc=f"Processing {group}"):
+        for cha_path in tqdm(sorted(group_dir.glob("*.cha")), desc=group):
             audio_file = None
-            for ext in ['.mp3', '.wav', '.WAV', '.MP3']:
-                if (cha_path.with_suffix(ext)).exists():
-                    audio_file = cha_path.with_suffix(ext)
+            for ext in [".wav", ".mp3"]:
+                candidate = cha_path.with_suffix(ext)
+                if candidate.exists():
+                    audio_file = candidate
                     break
             
             if not audio_file: continue
-
-            try:
-                with open(cha_path, 'r', encoding='utf-8-sig', errors='ignore') as f:
-                    segments = []
-                    for line in f:
-                        match = PAR_PATTERN.match(line.strip())
-                        if match:
-                            text_ts = match.group(1).strip()
-                            ts = TS_PATTERN.findall(text_ts)
-                            if ts:
-                                start, end = map(int, ts[-1])
-                                segments.append((start, end))
-                
-                if not segments: continue
-                full_audio = AudioSegment.from_file(audio_file)
-                p_audio = AudioSegment.empty()
-                for s, e in segments: p_audio += full_audio[s:e]
-                
-                out_path = AUDIO_OUT / f"{cha_path.stem}_participant.wav"
-                if save_processed_audio(p_audio, out_path):
+            
+            segmented = segment_audio(audio_file, cha_path)
+            if segmented:
+                out_path = out_audio / f"{cha_path.stem}.wav"
+                if save_processed_audio(segmented, out_path):
                     records.append({
-                        'participant_id': cha_path.stem, 'label': group, 'split': 'train',
-                        'audio_path': os.path.relpath(out_path, start=Path.cwd()), 'dataset': 'pitt'
+                        "participant_id": cha_path.stem,
+                        "label": group,
+                        "split": "cv",
+                        "audio_path": os.path.relpath(out_path, start=Path.cwd()),
+                        "dataset": "pitt",
+                        "age": None, "gender": None, "mmse": None
                     })
-            except: continue
+    return records
 
-    return pd.DataFrame(records)
-
-def preprocess_adress(output_base_dir):
-    print("\n" + "="*60 + "\nPREPROCESSING: ADReSS 2020\n" + "="*60)
-    DATA_DIR = Path("data/ADReSS")
-    OUTPUT_DIR = Path(output_base_dir) / "adress"
-    AUDIO_OUT = OUTPUT_DIR / "audio"
-    AUDIO_OUT.mkdir(parents=True, exist_ok=True)
+def process_adress(output_dir):
+    print("\nProcessing ADReSS...")
     records = []
+    data_root = Path("data/ADReSS")
+    out_audio = Path(output_dir) / "adress_segmented"
+    out_audio.mkdir(parents=True, exist_ok=True)
+
+    # 1. TRAIN SET
+    train_root = data_root / "ADReSS-IS2020-train" / "ADReSS-IS2020-data" / "train"
+    if train_root.exists():
+        for label, folder in [("Control", "cc"), ("Dementia", "cd")]:
+            meta_file = train_root / f"{folder}_meta_data.txt"
+            if not meta_file.exists(): continue
+            
+            meta_df = pd.read_csv(meta_file, sep=';')
+            meta_df = clean_df_headers(meta_df)
+            id_col = next((c for c in meta_df.columns if c.upper() == "ID"), meta_df.columns[0])
+            
+            for _, row in tqdm(meta_df.iterrows(), total=len(meta_df), desc=f"train-{folder}"):
+                pid = str(row[id_col]).strip()
+                wav_path = train_root / "Full_wave_enhanced_audio" / folder / f"{pid}.wav"
+                cha_path = train_root / "transcription" / folder / f"{pid}.cha"
+                
+                if not wav_path.exists() or not cha_path.exists(): continue
+                
+                segmented = segment_audio(wav_path, cha_path)
+                if segmented and save_processed_audio(segmented, out_audio / f"{pid}.wav"):
+                    records.append({
+                        "participant_id": pid, "label": label, "split": "train",
+                        "audio_path": os.path.relpath(out_audio / f"{pid}.wav", Path.cwd()),
+                        "dataset": "adress",
+                        "age": row.get('age'), "gender": row.get('gender'), "mmse": row.get('mmse')
+                    })
+
+    # 2. TEST SET
+    test_root = data_root / "ADReSS-IS2020-test" / "ADReSS-IS2020-data" / "test"
+    if test_root.exists():
+        meta_file = test_root / "test_results.txt"
+        if not meta_file.exists(): meta_file = test_root / "meta_data.txt"
+        
+        if meta_file.exists():
+            test_df = pd.read_csv(meta_file, sep=';')
+            test_df = clean_df_headers(test_df)
+            
+            id_col = next((c for c in test_df.columns if c.upper() == "ID"), test_df.columns[0])
+            dx_candidates = ["dx", "label", "prediction", "class", "diagnosis"]
+            dx_col = next((c for c in test_df.columns if c.lower() in dx_candidates), None)
+            
+            if dx_col is None and len(test_df.columns) > 3:
+                dx_col = test_df.columns[3]
+            
+            for _, row in tqdm(test_df.iterrows(), total=len(test_df), desc="test"):
+                pid = str(row[id_col]).strip()
+                dx_val = str(row[dx_col]).strip() if dx_col else "1"
+                label = "Control" if dx_val == '0' else "Dementia"
+                
+                wav_path = test_root / "Full_wave_enhanced_audio" / f"{pid}.wav"
+                cha_path = test_root / "transcription" / f"{pid}.cha"
+                
+                if not wav_path.exists() or not cha_path.exists(): continue
+                
+                segmented = segment_audio(wav_path, cha_path)
+                if segmented and save_processed_audio(segmented, out_audio / f"{pid}.wav"):
+                    records.append({
+                        "participant_id": pid, "label": label, "split": "test",
+                        "audio_path": os.path.relpath(out_audio / f"{pid}.wav", Path.cwd()),
+                        "dataset": "adress",
+                        "age": row.get('age'), "gender": row.get('gender'), "mmse": row.get('mmse')
+                    })
+    return records
+
+def process_taukadial(output_dir):
+    print("\nProcessing TAUKADIAL...")
+    records = []
+    data_dir = Path("data/TAUKADIAL")
+    out_audio = Path(output_dir) / "taukadial_segmented"
+    out_audio.mkdir(parents=True, exist_ok=True)
     
-    # 1. Train
-    train_dir = DATA_DIR / "ADReSS-IS2020-train" / "ADReSS-IS2020-data" / "train"
-    for label_type, folder in [('Control', 'cc'), ('Dementia', 'cd')]:
-        meta_file = train_dir / f"{folder}_meta_data.txt"
-        audio_dir = train_dir / "Full_wave_enhanced_audio" / folder
-        if meta_file.exists() and audio_dir.exists():
-            meta = pd.read_csv(meta_file, sep=';', skipinitialspace=True, header=None)
-            if "ID" in str(meta.iloc[0, 0]): meta = meta.iloc[1:].reset_index(drop=True)
-            for _, row in tqdm(meta.iterrows(), desc=f"ADReSS Train ({label_type})", total=len(meta)):
-                p_id = str(row[0]).strip()
-                wav_path = audio_dir / f"{p_id}.wav"
-                if wav_path.exists():
-                    try:
-                        audio = AudioSegment.from_wav(wav_path)
-                        out_path = AUDIO_OUT / f"{p_id}.wav"
-                        if save_processed_audio(audio, out_path):
-                            records.append({
-                                'participant_id': p_id, 'label': label_type, 'split': 'train',
-                                'audio_path': os.path.relpath(out_path, start=Path.cwd()), 'dataset': 'adress',
-                                'age': str(row[1]).strip(), 'gender': 'Male' if str(row[2]).strip() == '0' else 'Female'
-                            })
-                    except: continue
-
-    # 2. Test
-    test_dir = DATA_DIR / "ADReSS-IS2020-test" / "ADReSS-IS2020-data" / "test"
-    test_results = test_dir / "test_results.txt"
-    test_audio = test_dir / "Full_wave_enhanced_audio"
-    if test_results.exists() and test_audio.exists():
-        test_df = pd.read_csv(test_results, sep=';', skipinitialspace=True, header=None)
-        if "ID" in str(test_df.iloc[0, 0]): test_df = test_df.iloc[1:].reset_index(drop=True)
-        for _, row in tqdm(test_df.iterrows(), desc="ADReSS Test", total=len(test_df)):
-            p_id = str(row[0]).strip()
-            wav_path = test_audio / f"{p_id}.wav"
-            if wav_path.exists():
-                try:
-                    audio = AudioSegment.from_wav(wav_path)
-                    out_path = AUDIO_OUT / f"{p_id}.wav"
-                    if save_processed_audio(audio, out_path):
-                        label_code = str(row[3]).strip()
-                        records.append({
-                            'participant_id': p_id, 'label': 'Control' if label_code == '0' else 'Dementia',
-                            'split': 'test', 'audio_path': os.path.relpath(out_path, start=Path.cwd()), 
-                            'dataset': 'adress', 'age': str(row[1]).strip(), 
-                            'gender': 'Male' if str(row[2]).strip() == '0' else 'Female', 'mmse': str(row[4]).strip()
-                        })
-                except: continue
-
-    return pd.DataFrame(records)
-
-def preprocess_taukadial(output_base_dir):
-    print("\n" + "="*60 + "\nPREPROCESSING: TAUKADIAL\n" + "="*60)
-    DATA_DIR = Path("data/TAUKADIAL")
-    OUTPUT_DIR = Path(output_base_dir) / "taukadial"
-    AUDIO_OUT = OUTPUT_DIR / "audio"
-    AUDIO_OUT.mkdir(parents=True, exist_ok=True)
-    
-    # 1. Aggressive Label Collection with Dynamic Delimiter and Column Support
-    labels = {}
-    gt_files = [
-        DATA_DIR / "TAUKADIAL-24-train/TAUKADIAL-24/train/groundtruth.csv",
-        DATA_DIR / "testgroundtruth.csv"
+    gt_candidates = [
+        data_dir / "testgroundtruth.csv",
+        data_dir / "TAUKADIAL-24-train" / "TAUKADIAL-24" / "train" / "groundtruth.csv"
     ]
     
-    for gt_path in gt_files:
-        if not gt_path.exists(): continue
-        try:
-            # Use sep=None to auto-detect semicolon vs comma
-            gt_df = pd.read_csv(gt_path, sep=None, engine='python', skipinitialspace=True)
-            
-            # Identify column indices by name (agnostic to column count/order)
-            cols = [c.strip().lower() for c in gt_df.columns]
-            name_idx = next((i for i, c in enumerate(cols) if 'name' in c), 0)
-            dx_idx = next((i for i, c in enumerate(cols) if 'dx' in c), -1)
-            mmse_idx = next((i for i, c in enumerate(cols) if 'mmse' in c), -1)
-            
-            count = 0
-            for _, row in gt_df.iterrows():
-                filename = str(row.iloc[name_idx]).strip()
-                dx = str(row.iloc[dx_idx]).strip() if dx_idx != -1 else "Unknown"
-                mmse = str(row.iloc[mmse_idx]).strip() if mmse_idx != -1 else None
+    labels = {}
+    clinical_meta = {}
+    
+    for gt_path in gt_candidates:
+        if gt_path.exists():
+            try:
+                # Use engine='python' and sep=None to handle both ',' and ';'
+                gt_df = pd.read_csv(gt_path, sep=None, engine='python')
+                gt_df = clean_df_headers(gt_df)
                 
-                # Extract pid: e.g., taukdial-001 from taukdial-001-1.wav
-                pid_match = re.search(r'(taukdial-\d+)', filename)
-                if pid_match:
-                    pid = pid_match.group(1)
-                    # NC/NC-Control -> Control, MCI/Dementia -> Dementia
-                    clean_label = 'Control' if dx in ['NC', '0', 'HC', 'Control'] else 'Dementia'
-                    labels[pid] = {'label': clean_label, 'mmse': mmse}
-                    count += 1
-            print(f"Loaded {count} unique labels from {gt_path.name}")
-        except Exception as e:
-            print(f"Warning: Failed to parse {gt_path}: {e}")
+                name_col = next((c for c in gt_df.columns if 'name' in c.lower()), gt_df.columns[0])
+                dx_col = next((c for c in gt_df.columns if 'dx' in c.lower()), gt_df.columns[-1])
+                mmse_col = next((c for c in gt_df.columns if 'mmse' in c.lower()), None)
+                age_col = next((c for c in gt_df.columns if 'age' in c.lower()), None)
+                sex_col = next((c for c in gt_df.columns if c.lower() in ['sex', 'gender']), None)
+                
+                for row in gt_df.itertuples(index=False):
+                    row_dict = row._asdict()
+                    fname = str(row_dict.get(name_col))
+                    match = re.search(r"taukdial-(\d+)", fname)
+                    pid_key = match.group(1) if match else fname
+                    
+                    dx = str(row_dict.get(dx_col, '')).strip()
+                    labels[pid_key] = 'Control' if dx == 'NC' else 'Dementia'
+                    
+                    clinical_meta[pid_key] = {
+                        'mmse': row_dict.get(mmse_col),
+                        'age': row_dict.get(age_col),
+                        'gender': row_dict.get(sex_col)
+                    }
+                        
+            except Exception as e:
+                print(f"Warning: Failed to parse ground truth {gt_path}: {e}")
 
-    # 2. Process Files
-    records = []
-    for split in ['train', 'test']:
-        split_dir = DATA_DIR / f"TAUKADIAL-24-{split}" / "TAUKADIAL-24" / split
+    for split in ["train", "test"]:
+        split_dir = data_dir / f"TAUKADIAL-24-{split}" / "TAUKADIAL-24" / split
         if not split_dir.exists(): continue
         
-        # Group chunks
         p_groups = {}
         for wav in split_dir.glob("*.wav"):
-            pid_match = re.search(r'(taukdial-\d+)', wav.stem)
+            pid_match = re.search(r"taukdial-(\d+)", wav.stem)
             pid = pid_match.group(1) if pid_match else wav.stem
             if pid not in p_groups: p_groups[pid] = []
             p_groups[pid].append(wav)
             
         for pid, files in tqdm(p_groups.items(), desc=f"TAUKADIAL {split}"):
-            meta = labels.get(pid, {'label': 'Unknown', 'mmse': None})
-            
             combined = AudioSegment.empty()
             for f in sorted(files):
                 try: combined += AudioSegment.from_wav(f)
                 except: continue
             
-            out_path = AUDIO_OUT / f"{pid}.wav"
+            if len(combined) == 0: continue
+            out_path = out_audio / f"taukdial-{pid}.wav"
             if save_processed_audio(combined, out_path):
+                label = labels.get(pid, "Unknown")
+                meta = clinical_meta.get(pid, {})
                 records.append({
-                    'participant_id': pid, 'label': meta['label'], 'split': split,
-                    'audio_path': os.path.relpath(out_path, start=Path.cwd()), 
-                    'dataset': 'taukadial', 'mmse': meta['mmse']
+                    "participant_id": f"taukdial-{pid}", 
+                    "label": label, 
+                    "split": split,
+                    "audio_path": os.path.relpath(out_path, start=Path.cwd()),
+                    "dataset": "taukadial", 
+                    "age": meta.get('age'), 
+                    "gender": meta.get('gender'), 
+                    "mmse": meta.get('mmse')
                 })
-
-    return pd.DataFrame(records)
+    return records
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument('--datasets', nargs='+', default=['pitt', 'adress', 'taukadial'])
-    parser.add_argument('--output_dir', type=str, default='processed_data')
+    parser.add_argument("--output_dir", default="processed_data")
+    parser.add_argument("--datasets", nargs="+", default=["pitt", "adress", "taukadial"])
     args = parser.parse_args()
 
-    results = []
-    if 'pitt' in args.datasets: results.append(preprocess_dementiabank(args.output_dir))
-    if 'adress' in args.datasets: results.append(preprocess_adress(args.output_dir))
-    if 'taukadial' in args.datasets: results.append(preprocess_taukadial(args.output_dir))
+    all_records = []
+    if "pitt" in args.datasets: all_records.extend(process_pitt(args.output_dir))
+    if "adress" in args.datasets: all_records.extend(process_adress(args.output_dir))
+    if "taukadial" in args.datasets: all_records.extend(process_taukadial(args.output_dir))
+    
+    if not all_records:
+        print("Warning: No records processed.")
+        return
 
-    if results:
-        master_df = pd.concat(results, ignore_index=True)
-        cols = ['participant_id', 'label', 'split', 'audio_path', 'dataset', 'age', 'gender', 'mmse']
-        for col in cols:
-            if col not in master_df.columns: master_df[col] = None
-        
-        master_df = master_df[cols]
-        master_df.to_csv(Path(args.output_dir) / "master_metadata.csv", index=False)
-        print("\n" + "="*60 + "\nUNIFIED PIPELINE COMPLETE\n" + "="*60)
-        print(master_df.groupby(['dataset', 'label']).size())
+    master_df = pd.DataFrame(all_records)
+    out_csv = Path(args.output_dir) / "master_metadata.csv"
+    master_df.to_csv(out_csv, index=False)
+    
+    print(f"\nPipeline Complete. {len(master_df)} files processed.")
+    print(master_df.groupby(["dataset", "label"]).size())
 
 if __name__ == "__main__":
     main()
