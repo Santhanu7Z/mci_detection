@@ -1,33 +1,30 @@
 #!/bin/bash
-#SBATCH --job-name=mamba_group_cv
+#SBATCH --job-name=mamba_fusion_final
 #SBATCH --partition=gpu3060
 #SBATCH --gres=gpu:1
-#SBATCH --cpus-per-task=4
 #SBATCH --mem=32G
 #SBATCH --time=12:00:00
-#SBATCH --output=logs/benchmark_v3_4_%j.out
-#SBATCH --error=logs/benchmark_v3_4_%j.err
+#SBATCH --output=logs/benchmark_v4_9_%j.out
+#SBATCH --error=logs/benchmark_v4_9_%j.err
 
-# --- Environment Setup ---
-# Ensuring the local bin is in path for potential Mamba dependencies
-export PATH="$HOME/bin:$PATH"
-source .venv/bin/activate
-
-# Environmental Guardrail for Mamba (prevents triton compilation issues on some nodes)
-export MAMBA_NO_TRITON=1
-export PYTHONUNBUFFERED=1
-
-echo "============================================================"
-echo "Starting Unified Mamba-Fusion Benchmark v3.4"
+# --- Debug Info ---
+echo "========================================="
 echo "Job ID:    $SLURM_JOB_ID"
 echo "Node:      $(hostname)"
 echo "Started:   $(date)"
-echo "============================================================"
+echo "========================================="
+
+# --- Environment Setup ---
+cd $SLURM_SUBMIT_DIR
+source .venv/bin/activate
+
+# Ensure logs show up in real-time
+export PYTHONUNBUFFERED=1
 
 # --- Execution ---
-# This runs the full ablation suite: Linguistic, Acoustic, Gated, and Attention Fusion
+# Running the v4.9 Unified Benchmark
 python benchmark.py
 
-echo "============================================================"
-echo "Benchmark Finished: $(date)"
-echo "============================================================"
+echo "========================================="
+echo "Finished:  $(date)"
+echo "========================================="
