@@ -58,3 +58,12 @@ trained_mamba_attention_fusion/
 __pycache__/
 *.pyc
 .venv/
+processed_data/
+xai_results/
+cross_corpus_generalization_results.csv
+asr_validation_results_v5_0.csv
+logs/
+trained_mamba_attention_fusion/
+*.wav
+*.mp3
+*.flac
