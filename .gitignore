@@ -67,3 +67,7 @@ trained_mamba_attention_fusion/
 *.wav
 *.mp3
 *.flac
+
+# Exclude model weights and bulky research artifacts
+severity_model/
+severity_outputs.zip
