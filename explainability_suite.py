@@ -16,6 +16,7 @@ Label encoding: Control=0, Dementia=1
 """
 
 import os
+os.environ["CUDA_VISIBLE_DEVICES"] = ""
 import re
 import json
 import torch
@@ -45,22 +46,10 @@ except Exception:
     SPACY_OK = False
     print("⚠️  spaCy missing. pip install spacy && python -m spacy download en_core_web_sm")
 
-DEVICE = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
-if torch.cuda.is_available():
-    torch.cuda.set_device(0)
+DEVICE = torch.device("cpu")
+#if torch.cuda.is_available():
+#    torch.cuda.set_device(0)
 torch.manual_seed(42)
-
-_OrigCudaDevice = torch.cuda.device
-class _EmbedOverride(nn.Module):
-    """Thin nn.Module wrapper that returns pre-computed embeddings,
-    ignoring the input_ids. Used to inject modified embeddings into
-    Mamba's MixerModel without changing its forward signature."""
-    def __init__(self, precomputed):
-        super().__init__()
-        self._precomputed = precomputed          # [1, T, D] tensor
-
-    def forward(self, _ids):
-        return self._precomputed
 
 MC_SAMPLES = 5   # Monte Carlo samples per word for F2
 
@@ -163,39 +152,64 @@ class MambaFusionEngineDynamic(nn.Module):
 
         self.classifier = nn.Sequential(
             nn.Linear(clf_dim,128), nn.GELU(), nn.Dropout(0.3), nn.Linear(128,2))
-
     def forward(self, input_ids, acoustic_features, input_embeds=None):
+
         if input_embeds is not None:
-            orig_emb = self.mamba.embedding
-            self.mamba.embedding = _EmbedOverride(input_embeds)
-            text_raw = self.mamba(input_ids)
-            self.mamba.embedding = orig_emb
+
+            # Directly pass modified embeddings through backbone
+            text_raw = self.mamba(
+                hidden_states=input_embeds
+            )
+
         else:
+
             text_raw = self.mamba(input_ids)
 
-        text_out  = text_raw.mean(dim=1)           # mean pooling
-        text_emb  = self.text_proj(text_out)
+        text_out = text_raw.mean(dim=1)
+
+        text_emb = self.text_proj(text_out)
         audio_emb = self.audio_proj(acoustic_features)
 
         if self.clf_dim == 256:
+
             if hasattr(self, "fusion_layer"):
-                g       = self.fusion_layer["gate"](
-                              torch.cat([text_emb, audio_emb], dim=-1))
-                fused   = g * text_emb + (1-g) * audio_emb
+
+                g = self.fusion_layer["gate"](
+                    torch.cat([text_emb, audio_emb], dim=-1)
+                )
+
+                fused = g * text_emb + (1 - g) * audio_emb
                 weights = g.detach().cpu()
+
             else:
-                fused, weights = text_emb * audio_emb, None
+
+                fused = text_emb * audio_emb
+                weights = None
+
         else:
-            combined         = torch.stack([text_emb, audio_emb], dim=1)
-            attn_out, attn_w = self.attention(combined, combined, combined)
-            if attn_w.dim()==4:
+
+            combined = torch.stack([text_emb, audio_emb], dim=1)
+
+            attn_out, attn_w = self.attention(
+                combined,
+                combined,
+                combined
+            )
+
+            if attn_w.dim() == 4:
                 attn_w = attn_w.mean(dim=1)
-            fused   = torch.cat(
-                [attn_out.flatten(start_dim=1), text_emb*audio_emb], dim=-1)
+
+            fused = torch.cat(
+                [
+                    attn_out.flatten(start_dim=1),
+                    text_emb * audio_emb
+                ],
+                dim=-1
+            )
+
             weights = attn_w.detach().cpu()
 
         return self.classifier(fused), weights
-
     def get_input_embeddings(self):
         return self.mamba.embedding
 
@@ -451,7 +465,7 @@ def extract_linguistic_features(text):
 # MAIN XAI PIPELINE
 # ============================================================
 
-def run_xai(df, acoustic_data, tokenizer, model, n_samples=200):
+def run_xai(df, acoustic_data, tokenizer, model, n_samples=200, output_dir="xai_results"):
 
     print(f"\n{'='*65}")
     print(f"XAI v6.0  —  n={n_samples}  MC_SAMPLES={MC_SAMPLES}")
@@ -463,7 +477,7 @@ def run_xai(df, acoustic_data, tokenizer, model, n_samples=200):
     print("F5: Strict token containment in offset mapping")
     print("F6: Confidence-calibrated Δp / p(1-p)")
 
-    os.makedirs("xai_results", exist_ok=True)
+    os.makedirs(output_dir, exist_ok=True)
 
     # ── Stratified sample: equal Control / Dementia, shuffled ────────────────
     ctrl_idx = df[df["label"] == "Control"].index.tolist()
@@ -559,7 +573,7 @@ def run_xai(df, acoustic_data, tokenizer, model, n_samples=200):
             "label":   df_sel.iloc[:len(t_arr)]["label"].values,
             "dataset": df_sel.iloc[:len(t_arr)]["dataset"].values,
         })
-        mod_df.to_csv("xai_results/modality_weights.csv", index=False)
+        mod_df.to_csv(f"{output_dir}/modality_weights.csv", index=False)
 
         datasets = mod_df["dataset"].unique()
         fig, axes = plt.subplots(1, 1+len(datasets),
@@ -584,7 +598,7 @@ def run_xai(df, acoustic_data, tokenizer, model, n_samples=200):
         fig.suptitle(f"Modality Contribution — Paired d={d_paired:.2f}, p={p_val:.2e}",
                      y=1.03)
         plt.tight_layout()
-        plt.savefig("xai_results/modality_weights.png", dpi=300,
+        plt.savefig(f"{output_dir}/modality_weights.png", dpi=300,
                     bbox_inches="tight")
         plt.close()
         print("Saved → xai_results/modality_weights.png")
@@ -593,7 +607,7 @@ def run_xai(df, acoustic_data, tokenizer, model, n_samples=200):
     # B — LINGUISTIC FEATURES  (BH-FDR + independent Cohen's d)
     # =================================================================
     ling_df = pd.DataFrame(ling_records)
-    ling_df.to_csv("xai_results/linguistic_features.csv", index=False)
+    ling_df.to_csv(f"{output_dir}/linguistic_features.csv", index=False)
     feat_cols_ling = [c for c in ling_df.columns
                       if c not in ("label","dataset","sample_idx")]
     ctrl = ling_df[ling_df["label"]=="Control"]
@@ -625,7 +639,7 @@ def run_xai(df, acoustic_data, tokenizer, model, n_samples=200):
             stat_df["p_adj"] = stat_df["p_raw"]
         stat_df["sig"] = stat_df["p_adj"].apply(
             lambda p: "***" if p<0.001 else "**" if p<0.01 else "*" if p<0.05 else "ns")
-    stat_df.to_csv("xai_results/linguistic_stats.csv", index=False)
+    stat_df.to_csv(f"{output_dir}/linguistic_stats.csv", index=False)
 
     print(f"\n{'='*65}")
     print("B — LINGUISTIC FEATURES  (BH-FDR corrected)")
@@ -661,7 +675,7 @@ def run_xai(df, acoustic_data, tokenizer, model, n_samples=200):
         ax.set_title("Significant Linguistic Features "
                      "(Mann-Whitney U + BH-FDR, independent Cohen's d)")
         plt.tight_layout()
-        plt.savefig("xai_results/linguistic_features.png", dpi=300)
+        plt.savefig(f"{output_dir}/linguistic_features.png", dpi=300)
         plt.close()
         print("Saved → xai_results/linguistic_features.png")
     else:
@@ -684,7 +698,7 @@ def run_xai(df, acoustic_data, tokenizer, model, n_samples=200):
     # FIX F4: Wilcoxon signed-rank test vs H0: median=0
     # =================================================================
     fp_df = pd.DataFrame(feat_pert)
-    fp_df.to_csv("xai_results/feature_perturbation.csv", index=False)
+    fp_df.to_csv(f"{output_dir}/feature_perturbation.csv", index=False)
     cat_cols = [c for c in fp_df.columns
                 if c not in ("label","dataset","sample_idx")]
 
@@ -739,7 +753,7 @@ def run_xai(df, acoustic_data, tokenizer, model, n_samples=200):
             "red=Dementia-indicative  blue=Control-indicative")
         ax.set_title("Feature-Category Perturbation (v6.0)")
         plt.tight_layout()
-        plt.savefig("xai_results/feature_perturbation.png", dpi=300)
+        plt.savefig(f"{output_dir}/feature_perturbation.png", dpi=300)
         plt.close()
         print("Saved → xai_results/feature_perturbation.png")
 
@@ -751,7 +765,7 @@ def run_xai(df, acoustic_data, tokenizer, model, n_samples=200):
     if word_df.empty:
         print("\n⚠️  No word records.")
     else:
-        word_df.to_csv("xai_results/word_importance_raw.csv", index=False)
+        word_df.to_csv(f"{output_dir}/word_importance_raw.csv", index=False)
 
         for min_freq in (5, 3, 2, 1):
             ws = (word_df.groupby("word")
@@ -763,7 +777,7 @@ def run_xai(df, acoustic_data, tokenizer, model, n_samples=200):
 
         ws["norm_importance"] = ws["mean_importance"] / np.log1p(ws["freq"])
         top20 = ws.sort_values("norm_importance", ascending=False).head(20)
-        top20.to_csv("xai_results/word_importance_top.csv")
+        top20.to_csv(f"{output_dir}/word_importance_top.csv")
 
         colors = ["#d62728" if v>=0 else "#1f77b4"
                   for v in top20["norm_importance"]]
@@ -778,7 +792,7 @@ def run_xai(df, acoustic_data, tokenizer, model, n_samples=200):
             "red=Dementia-indicative  blue=Control-indicative")
         ax.set_title("Top Words — MC Embedding-Masked Perturbation (v6.0)")
         plt.tight_layout()
-        plt.savefig("xai_results/words.png", dpi=300)
+        plt.savefig(f"{output_dir}/words.png", dpi=300)
         plt.close()
 
         for ds in word_df["dataset"].unique():
@@ -790,7 +804,7 @@ def run_xai(df, acoustic_data, tokenizer, model, n_samples=200):
                    .sort_values("mean_importance", ascending=False)
                    .head(15))
             if not dsw.empty:
-                dsw.to_csv(f"xai_results/words_{ds}.csv")
+                dsw.to_csv(f"{output_dir}//words_{ds}.csv")
                 print(f"Saved → xai_results/words_{ds}.csv  ({len(dsw)} words)")
 
         print(f"\nWord plot: {len(top20)} words (min_freq={min_freq})")
@@ -799,8 +813,8 @@ def run_xai(df, acoustic_data, tokenizer, model, n_samples=200):
     print(f"\n{'='*65}")
     print("✅  XAI v6.0 Complete")
     print(f"{'='*65}")
-    for f in sorted(os.listdir("xai_results")):
-        kb = os.path.getsize(f"xai_results/{f}") // 1024
+    for f in sorted(os.listdir(output_dir)):
+        kb = os.path.getsize(f"{output_dir}/{f}") // 1024
         print(f"  {f:<48} {kb:>4} KB")
 
 

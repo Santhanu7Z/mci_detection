@@ -50,6 +50,13 @@ Critical fixes applied vs v3.0
 [F10] SHM FIX & BOUNDED RESIDUALS
      num_workers=0 to fix Shared Memory crashes. fusion_gated uses a 
      Sigmoid-bounded learned alpha. fusion_attn flattens to prevent double-smoothing.
+
+[F11] ABLATION SUPPORT (v4.1 addition)
+     --feature_csv  selects any eGeMAPS CSV in processed_data/ without
+                    editing the source file.
+     --run_tag      appends a suffix to all four output files so baseline
+                    and ablation runs never collide and resumption works
+                    correctly for each independently.
 """
 
 import os, json, copy, random, argparse, csv, time
@@ -66,7 +73,7 @@ from sklearn.metrics import (
     accuracy_score, f1_score,
     precision_recall_fscore_support,
     roc_auc_score, matthews_corrcoef,
-    brier_score_loss # [F4] Added Brier Score
+    brier_score_loss
 )
 from sklearn.model_selection import StratifiedGroupKFold, StratifiedShuffleSplit
 from sklearn.preprocessing import StandardScaler
@@ -79,18 +86,18 @@ os.environ["MAMBA_NO_TRITON"] = "1"
 # ── Hyperparameters (aligned with benchmark.py) ───────────────────────────────
 HPARAMS = dict(
     epochs      = 20,
-    min_epochs  = 8,        # no early stopping before this
+    min_epochs  = 8,
     patience    = 5,
     batch_size  = 8,
-    lr_backbone = 2e-5,     # differential LR — backbone
-    lr_head     = 1e-4,     # differential LR — head
+    lr_backbone = 2e-5,
+    lr_head     = 1e-4,
     wd_backbone = 0.01,
     wd_head     = 0.05,
     max_len     = 512,
     n_seeds     = 3,
     base_seed   = 42,
-    val_frac    = 0.15,     # validation fraction (min 20 samples)
-    pool_folds  = 5,        # CV folds for Unified Pool
+    val_frac    = 0.15,
+    pool_folds  = 5,
 )
 
 MODES = [
@@ -103,7 +110,6 @@ MODES = [
     "fusion_attn",
 ]
 
-# LODO splits  +  Unified Pool (tag="POOL")
 LODO_COMBOS = [
     # Multi-domain
     {"train": ["pitt", "adress"],      "test": "taukadial", "tag": "PA->T",  "pool": False},
@@ -126,13 +132,15 @@ CKPT_DIR     = "checkpoints"
 LOG_DIR      = "logs"
 MAMBA_ID     = "state-spaces/mamba-130m"
 TOKENIZER_ID = "EleutherAI/gpt-neox-20b"
+
+# These four are reassigned in __main__ when --run_tag is supplied.
 RESULTS_FILE = "lodo_results.csv"
 SUMMARY_FILE = "lodo_summary.csv"
 REPORT_FILE  = "lodo_report.txt"
 TRAIN_LOG    = os.path.join(LOG_DIR, "training_log.csv")
 
 METRIC_COLS = [
-    "accuracy", "f1_weighted", "f1_macro", "auc_roc", "brier_score", # [F4] Added Brier
+    "accuracy", "f1_weighted", "f1_macro", "auc_roc", "brier_score",
     "mcc", "sensitivity", "specificity", "precision_dem", "precision_ctrl",
 ]
 
@@ -141,7 +149,7 @@ _EG_MODES   = {"acoustic_egemaps", "interaction_only", "fusion_gated", "fusion_a
 _W2V_MODES  = {"acoustic_w2v"}
 _HUB_MODES  = {"acoustic_hubert"}
 _DEEP_MODES = {"interaction_only", "fusion_gated", "fusion_attn"}
-_PAIRWISE   = {"interaction_only", "fusion_gated", "fusion_attn"}   # use pairwise interact
+_PAIRWISE   = {"interaction_only", "fusion_gated", "fusion_attn"}
 
 
 # ════════════════════════════════════════════════════════════════════════════════
@@ -219,7 +227,7 @@ class TrimodalDataset(Dataset):
         )
         return {
             "input_ids":      enc["input_ids"].squeeze(0),
-            "attention_mask": enc["attention_mask"].squeeze(0),   # [F1] needed for masked mean
+            "attention_mask": enc["attention_mask"].squeeze(0),
             "egemap":         torch.tensor(self.egemap[idx],     dtype=torch.float32),
             "deep_audio":     torch.tensor(self.deep_audio[idx], dtype=torch.float32),
             "labels":         torch.tensor(int(self.df.loc[idx, "label_id"]), dtype=torch.long),
@@ -233,15 +241,8 @@ class TrimodalDataset(Dataset):
 class PairwiseInteraction(nn.Module):
     """
     Stable multi-modal interaction replacing triple product.
-
     Input : three 256-d embeddings (t, a, d)
-    Output: 256-d fused feature via:
-      concat([t, a, d, t*a, t*d, a*d]) → Linear(6×256, 256) → GELU
-
-    Gradient w.r.t. t = grad_output · W[:, 0:256]   (from t term)
-                      + grad_output · W[:, 768:1024] * a  (from t*a term)
-                      + grad_output · W[:, 1024:1280] * d  (from t*d term)
-    → always non-zero as long as W has non-zero entries.
+    Output: 256-d fused feature via concat([t,a,d,t*a,t*d,a*d]) → Linear → GELU
     """
     def __init__(self, fdim: int = 256):
         super().__init__()
@@ -260,17 +261,6 @@ class PairwiseInteraction(nn.Module):
 # ════════════════════════════════════════════════════════════════════════════════
 
 class MultiModeFusionEngine(nn.Module):
-    """
-    All 7 architectures in one class.
-
-    Key design decisions (v4.1):
-      [F1] Masked mean pooling over token dimension
-      [F2] Pairwise interaction instead of triple product
-      [F3] No WeightedRandomSampler; class-weighted CE loss instead
-      [F6] Attention-based modality weights logged as attn_proxy_*
-      [F10] Bounded Learned Alpha and Flattened Attention
-    """
-
     def __init__(self, mode: str, mamba_model=None,
                  egemap_dim: int = 88, deep_audio_dim: int = 1536,
                  num_labels: int = 2, class_weights=None):
@@ -280,49 +270,41 @@ class MultiModeFusionEngine(nn.Module):
         fdim      = 256
         text_dim  = 768
 
-        # ── Text stream (UNFROZEN — differential LR) ──────────────────────────
         if mode in _TEXT_MODES:
             assert mamba_model is not None
             self.mamba = mamba_model.backbone
             self.text_proj = nn.Linear(text_dim, fdim)
 
-        # ── eGeMAPS stream ────────────────────────────────────────────────────
         if mode in _EG_MODES:
             self.egemap_proj = nn.Sequential(
                 nn.Linear(egemap_dim, 128), nn.GELU(), nn.Linear(128, fdim)
             )
 
-        # ── Wav2Vec2-only stream ───────────────────────────────────────────────
         if mode in _W2V_MODES:
             self.w2v_proj = nn.Sequential(
                 nn.Linear(768, 512), nn.GELU(), nn.Dropout(0.2), nn.Linear(512, fdim)
             )
 
-        # ── HuBERT-only stream ────────────────────────────────────────────────
         if mode in _HUB_MODES:
             self.hubert_proj = nn.Sequential(
                 nn.Linear(768, 512), nn.GELU(), nn.Dropout(0.2), nn.Linear(512, fdim)
             )
 
-        # ── Combined deep-audio stream ─────────────────────────────────────────
         if mode in _DEEP_MODES:
             self.deep_proj = nn.Sequential(
                 nn.Linear(deep_audio_dim, 512), nn.GELU(), nn.Dropout(0.2), nn.Linear(512, fdim)
             )
 
-        # ── Pairwise interaction module [F2] ──────────────────────────────────
         if mode in _PAIRWISE:
             self.pairwise = PairwiseInteraction(fdim)
 
-        # ── 3-way softmax gate ────────────────────────────────────────────────
         if mode == "fusion_gated":
             self.gate_layer = nn.Linear(fdim * 3, 3)
-            self.pw_alpha = nn.Parameter(torch.tensor(-2.2)) # [F10] Bounded Alpha initialized near 0.1
+            self.pw_alpha = nn.Parameter(torch.tensor(-2.2))
 
-        # ── 3-way cross-modal attention ───────────────────────────────────────
         if mode == "fusion_attn":
             self.attention = nn.MultiheadAttention(fdim, num_heads=4, batch_first=True)
-            clf_in = fdim * 4   # [F10] [flattened_attn(768) + pairwise(256)] = 1024
+            clf_in = fdim * 4
         else:
             clf_in = fdim
 
@@ -330,26 +312,19 @@ class MultiModeFusionEngine(nn.Module):
             nn.Linear(clf_in, 128), nn.GELU(), nn.Dropout(0.3), nn.Linear(128, num_labels)
         )
 
-        # Class-weighted loss [F3] — consistent with sampler-free training
         w = torch.tensor(class_weights, dtype=torch.float32) if class_weights is not None else None
         self.criterion = nn.CrossEntropyLoss(weight=w)
 
-    # ── [F1] Masked mean pooling ───────────────────────────────────────────────
     def _masked_mean(self, hidden: torch.Tensor,
                      attention_mask: torch.Tensor) -> torch.Tensor:
-        """
-        hidden         : [B, T, D]
-        attention_mask : [B, T]   — 1 for real tokens, 0 for padding
-        Returns        : [B, D]   — mean over real tokens only
-        """
-        mask = attention_mask.unsqueeze(-1).float()          # [B, T, 1]
-        summed   = (hidden * mask).sum(dim=1)                # [B, D]
-        n_tokens = mask.sum(dim=1).clamp(min=1e-6)           # [B, 1]
+        mask     = attention_mask.unsqueeze(-1).float()
+        summed   = (hidden * mask).sum(dim=1)
+        n_tokens = mask.sum(dim=1).clamp(min=1e-6)
         return summed / n_tokens
 
     def _encode_text(self, input_ids, attention_mask):
-        hidden = self.mamba(input_ids)                       # [B, T, 768]
-        return self._masked_mean(hidden, attention_mask)     # [B, 768]
+        hidden = self.mamba(input_ids)
+        return self._masked_mean(hidden, attention_mask)
 
     def forward(self, input_ids, attention_mask, egemap, deep_audio, labels=None):
         m          = self.mode
@@ -372,30 +347,27 @@ class MultiModeFusionEngine(nn.Module):
             t    = self.text_proj(self._encode_text(input_ids, attention_mask))
             a    = self.egemap_proj(egemap)
             d    = self.deep_proj(deep_audio)
-            feat = self.pairwise(t, a, d)    # [F2] stable pairwise
+            feat = self.pairwise(t, a, d)
 
         elif m == "fusion_gated":
             t      = self.text_proj(self._encode_text(input_ids, attention_mask))
             a      = self.egemap_proj(egemap)
             d      = self.deep_proj(deep_audio)
-            pw     = self.pairwise(t, a, d)  # [F2]
+            pw     = self.pairwise(t, a, d)
             g      = torch.softmax(self.gate_layer(torch.cat([t, a, d], dim=-1)), dim=-1)
-            alpha  = torch.sigmoid(self.pw_alpha) # [F10] Bounded scalar (0 to 1)
+            alpha  = torch.sigmoid(self.pw_alpha)
             feat   = g[:, 0:1] * t + g[:, 1:2] * a + g[:, 2:3] * d + pw * alpha
-            # Softmax gate weights are more reliable than attention weights [F6]
-            attn_proxy = g.detach()  # [B, 3] — text / eGeMAPS / deep
+            attn_proxy = g.detach()
 
         elif m == "fusion_attn":
             t      = self.text_proj(self._encode_text(input_ids, attention_mask))
             a      = self.egemap_proj(egemap)
             d      = self.deep_proj(deep_audio)
-            pw     = self.pairwise(t, a, d)  # [F2]
+            pw     = self.pairwise(t, a, d)
             tokens = torch.stack([t, a, d], dim=1)
             out, w = self.attention(tokens, tokens, tokens)
-            # [F6] log but clearly mark as proxy
-            attn_proxy = w.detach().mean(dim=1) if w is not None else None  # [B, 3]
-            # [F10] flatten attention out instead of double smoothing mean
-            feat   = torch.cat([out.flatten(start_dim=1), pw], dim=-1)  # [B, 1024]
+            attn_proxy = w.detach().mean(dim=1) if w is not None else None
+            feat   = torch.cat([out.flatten(start_dim=1), pw], dim=-1)
 
         logits = self.classifier(feat)
         loss   = self.criterion(logits, labels) if labels is not None else None
@@ -412,15 +384,14 @@ def compute_metrics(labels, preds, probs_dem=None) -> dict:
     prec, rec, _, _ = precision_recall_fscore_support(
         labels, preds, average=None, labels=[0, 1], zero_division=0
     )
-    # [F4] Honest AUC and Brier Score
     auc = np.nan
     brier = np.nan
     if probs_dem is not None and len(np.unique(labels)) > 1:
         try:
-            auc = float(roc_auc_score(labels, probs_dem))
+            auc   = float(roc_auc_score(labels, probs_dem))
             brier = float(brier_score_loss(labels, probs_dem))
         except ValueError:
-            auc = np.nan
+            auc   = np.nan
             brier = np.nan
 
     return {
@@ -458,7 +429,7 @@ def evaluate(model, loader, device) -> dict:
         with autocast(enabled=(device.type == "cuda")):
             loss, logits, proxy = model(ids, mask, eg, da, y)
 
-        probs = torch.softmax(logits.float(), dim=-1) # [F7] Cast to float32
+        probs = torch.softmax(logits.float(), dim=-1)
         losses.append(loss.item())
         all_preds.extend(torch.argmax(logits, 1).cpu().numpy())
         all_labels.extend(y.cpu().numpy())
@@ -470,7 +441,6 @@ def evaluate(model, loader, device) -> dict:
     m["loss"]      = float(np.mean(losses))
     m["composite"] = 0.5 * m["f1_macro"] + 0.5 * m["f1_weighted"]
 
-    # [F6] Modality proxy weights — labelled clearly
     if all_proxy:
         w_mean = np.concatenate(all_proxy, axis=0).mean(axis=0)
         m["attn_proxy_text"]   = float(w_mean[0])
@@ -498,17 +468,12 @@ def train_model(
     set_seed(seed)
     n_train = len(train_df)
 
-    # ── [F5] Stratified validation split ──────────────────────────────────────
     n_val = max(20, int(hp["val_frac"] * n_train))
     n_val = min(n_val, n_train // 3)
     try:
-        sss     = StratifiedShuffleSplit(n_splits=1, test_size=n_val,
-                                         random_state=seed)
-        tr_pos, val_pos = next(sss.split(
-            np.zeros(n_train), train_df["label_id"].values
-        ))
+        sss     = StratifiedShuffleSplit(n_splits=1, test_size=n_val, random_state=seed)
+        tr_pos, val_pos = next(sss.split(np.zeros(n_train), train_df["label_id"].values))
     except ValueError:
-        # Fallback: too few samples per class — random split
         val_pos = np.random.choice(n_train, n_val, replace=False)
         tr_pos  = np.setdiff1d(np.arange(n_train), val_pos)
 
@@ -517,10 +482,9 @@ def train_model(
     tr_eg_i = tr_eg[tr_pos];  va_eg_i = tr_eg[val_pos]
     tr_da_i = tr_da[tr_pos];  va_da_i = tr_da[val_pos]
 
-    # ── [F3] Class weights for loss (no sampler) + Clipping ───────────────────
-    y_tr        = tr_df_i["label_id"].values
-    cw          = compute_class_weight("balanced", classes=np.array([0, 1]), y=y_tr)
-    class_w     = np.clip(cw, 0.5, 5.0).tolist() # Prevent blowing up on small single-domain splits
+    y_tr    = tr_df_i["label_id"].values
+    cw      = compute_class_weight("balanced", classes=np.array([0, 1]), y=y_tr)
+    class_w = np.clip(cw, 0.5, 5.0).tolist()
 
     model = MultiModeFusionEngine(
         mode=mode,
@@ -530,11 +494,9 @@ def train_model(
         class_weights=class_w,
     ).to(device)
 
-    # Move class weights to device (they were registered in criterion)
     if model.criterion.weight is not None:
         model.criterion.weight = model.criterion.weight.to(device)
 
-    # ── Differential LR ───────────────────────────────────────────────────────
     if mode in _TEXT_MODES:
         param_groups = [
             {"params": model.mamba.parameters(),
@@ -549,19 +511,16 @@ def train_model(
         ]
 
     optimizer = torch.optim.AdamW(param_groups)
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-        optimizer, T_max=hp["epochs"]
-    )
-    scaler = GradScaler(enabled=(device.type == "cuda"))  # [F7] AMP
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=hp["epochs"])
+    scaler    = GradScaler(enabled=(device.type == "cuda"))
 
     tr_ds = TrimodalDataset(tr_df_i, tokenizer, tr_eg_i, tr_da_i, hp["max_len"])
     va_ds = TrimodalDataset(va_df_i, tokenizer, va_eg_i, va_da_i, hp["max_len"])
     tr_ld = DataLoader(tr_ds, batch_size=hp["batch_size"],
-                       shuffle=True, num_workers=0, pin_memory=True) # [F10] num_workers=0 avoids SHM crash
+                       shuffle=True, num_workers=0, pin_memory=True)
     va_ld = DataLoader(va_ds, batch_size=hp["batch_size"] * 2)
 
     best_composite, best_state, patience_ctr = -1.0, copy.deepcopy(model.state_dict()), 0
-    ckpt_path = os.path.join(CKPT_DIR, f"{ckpt_key}_f{fold}.pt") if ckpt_key else None
 
     for epoch in range(hp["epochs"]):
         model.train()
@@ -581,10 +540,9 @@ def train_model(
             scaler.update()
 
         scheduler.step()
-        val_m = evaluate(model, va_ld, device)
+        val_m     = evaluate(model, va_ld, device)
         composite = val_m["composite"]
 
-        # [F9] Log epoch
         log_epoch(mode, tag, seed, fold, epoch + 1, val_m)
 
         improved = composite > best_composite
@@ -592,9 +550,6 @@ def train_model(
             best_composite = composite
             best_state     = copy.deepcopy(model.state_dict())
             patience_ctr   = 0
-            # if ckpt_path:
-            #    torch.save(best_state, ckpt_path)  # [F8] Disabled to prevent 100GB quota crash
-
         elif epoch >= hp["min_epochs"]:
             patience_ctr += 1
             if patience_ctr >= hp["patience"]:
@@ -616,7 +571,7 @@ def train_model(
 
 
 # ════════════════════════════════════════════════════════════════════════════════
-# UNIFIED POOL RUNNER  (mirrors benchmark.py exactly)
+# UNIFIED POOL RUNNER
 # ════════════════════════════════════════════════════════════════════════════════
 
 def run_pool(
@@ -624,14 +579,8 @@ def run_pool(
     tokenizer, device, hp: dict, seed: int,
     mamba_backbone=None,
 ) -> dict:
-    """
-    5-fold stratified group CV on all data.
-    Returns per-target mean metrics (averaged across folds).
-    This is benchmark.py's training strategy translated to the trimodal setting.
-    """
     set_seed(seed)
-    sgkf    = StratifiedGroupKFold(n_splits=hp["pool_folds"],
-                                    shuffle=True, random_state=seed)
+    sgkf    = StratifiedGroupKFold(n_splits=hp["pool_folds"], shuffle=True, random_state=seed)
     groups  = meta["participant_id"].values
     labels  = meta["label_id"].values
     datasets = meta["dataset"].unique()
@@ -646,7 +595,7 @@ def run_pool(
         eg_sc = StandardScaler()
         da_sc = StandardScaler()
         tr_eg = eg_sc.fit_transform(egemap_all[tr_idx])
-        te_eg = sc = eg_sc.transform(egemap_all[te_idx])
+        te_eg = eg_sc.transform(egemap_all[te_idx])
         tr_da = da_sc.fit_transform(deep_all[tr_idx])
         te_da = da_sc.transform(deep_all[te_idx])
 
@@ -659,9 +608,8 @@ def run_pool(
             tag="POOL",
         )
 
-        # Evaluate per target dataset within this fold's test split
         for ds in datasets:
-            ds_mask = te_df["dataset"] == ds
+            ds_mask  = te_df["dataset"] == ds
             if ds_mask.sum() == 0:
                 continue
             ds_te_df = te_df[ds_mask].reset_index(drop=True)
@@ -677,7 +625,6 @@ def run_pool(
         del model
         torch.cuda.empty_cache()
 
-    # Average across folds per dataset
     result_rows = []
     for ds, folds in fold_metrics.items():
         if not folds:
@@ -690,7 +637,6 @@ def run_pool(
         for k in METRIC_COLS:
             vals = [f[k] for f in folds if not np.isnan(f.get(k, np.nan))]
             row[k] = float(np.mean(vals)) if vals else np.nan
-        # Proxy weights (only meaningful for gated/attn)
         for pw in ("attn_proxy_text", "attn_proxy_egemap", "attn_proxy_deep"):
             vals = [f[pw] for f in folds if f.get(pw) is not None]
             row[pw] = float(np.mean(vals)) if vals else None
@@ -700,11 +646,24 @@ def run_pool(
 
 
 # ════════════════════════════════════════════════════════════════════════════════
-# DATA LOADING
+# DATA LOADING  [F11: feature_csv parameter]
 # ════════════════════════════════════════════════════════════════════════════════
 
-def load_all_data():
+def load_all_data(feature_csv="master_acoustic_features.csv"):
+    """
+    Load and align all modalities.
+
+    Parameters
+    ----------
+    feature_csv : str
+        Filename of the eGeMAPS feature CSV, relative to DATA_DIR.
+        Defaults to 'master_acoustic_features.csv' (baseline).
+        Pass 'master_acoustic_features_robust.csv' (or any other name)
+        for ablation runs without editing any other code.
+    """
     print("\n─── Loading data ────────────────────────────────────────────────")
+    print(f"    eGeMAPS CSV : {feature_csv}")
+
     meta = pd.read_csv(os.path.join(DATA_DIR, "master_metadata_cleaned.csv"))
 
     with open(os.path.join(DATA_DIR, "cleaned_transcripts.json")) as f:
@@ -717,10 +676,10 @@ def load_all_data():
     meta["label_id"] = meta["label"].map({"Control": 0, "Dementia": 1})
 
     # eGeMAPS — robust join (benchmark.py pattern)
-    eg_df   = pd.read_csv(os.path.join(DATA_DIR, "master_acoustic_features.csv"))
+    eg_df   = pd.read_csv(os.path.join(DATA_DIR, feature_csv))
     eg_cols = [c for c in eg_df.columns
-               if c not in ("participant_id","audio_path","label",
-                            "dataset","split","age","gender","mmse")]
+               if c not in ("participant_id", "audio_path", "label",
+                            "dataset", "split", "age", "gender", "mmse")]
     jcol    = "audio_path" if "audio_path" in eg_df.columns else "participant_id"
     meta    = pd.merge(meta, eg_df[[jcol] + eg_cols],
                        on=jcol, how="inner").reset_index(drop=True)
@@ -744,9 +703,9 @@ def load_all_data():
     egemap_all = meta[eg_cols].values.astype(np.float32)
     deep_all   = np.hstack([w2v[da_idx], hub[da_idx]]).astype(np.float32)
 
-    print(f"Aligned N      : {len(meta)}")
-    print(f"eGeMAPS dim    : {egemap_all.shape[1]}")
-    print(f"Deep-audio dim : {deep_all.shape[1]}")
+    print(f"    Aligned N      : {len(meta)}")
+    print(f"    eGeMAPS dim    : {egemap_all.shape[1]}")
+    print(f"    Deep-audio dim : {deep_all.shape[1]}")
     print(meta.groupby(["dataset", "label"]).size().to_string())
     return meta, egemap_all, deep_all, eg_cols
 
@@ -797,7 +756,6 @@ def generate_report(summary_df: pd.DataFrame):
             sub     = summary_df[summary_df["tag"] == tag]
 
             if is_pool:
-                # Pool: one row per (mode, test_dataset)
                 target_datasets = sub["test_dataset"].dropna().unique() if "test_dataset" in sub.columns else []
                 for tds in sorted(target_datasets):
                     lines += [
@@ -841,7 +799,6 @@ def generate_report(summary_df: pd.DataFrame):
     _block(single, "SINGLE-DOMAIN (1→1)")
     _block(pool_c, "UNIFIED POOL (5-fold CV — upper bound reference)")
 
-    # Best architecture per split
     lines += ["", sep, "  BEST ARCHITECTURE PER SPLIT  (by mean AUC-ROC)", "─" * 85]
     for combo in LODO_COMBOS:
         tag = combo["tag"]
@@ -876,7 +833,6 @@ def generate_report(summary_df: pd.DataFrame):
                 f"MCC={best['mcc_mean']:.4f}"
             )
 
-    # LODO vs Pool gap (AUC reference)
     lodo_sub = summary_df[summary_df["tag"] != "POOL"]
     pool_sub = summary_df[summary_df["tag"] == "POOL"]
     if not lodo_sub.empty and not pool_sub.empty:
@@ -893,7 +849,6 @@ def generate_report(summary_df: pd.DataFrame):
                 f"gap={pool_auc - lodo_auc:+.4f}"
             )
 
-    # Global ranking
     lines += ["", sep,
               "  GLOBAL RANKING  (mean AUC-ROC — LODO splits only)", "─" * 70]
     if not lodo_sub.empty:
@@ -926,10 +881,11 @@ def generate_report(summary_df: pd.DataFrame):
 
 
 # ════════════════════════════════════════════════════════════════════════════════
-# MAIN LOOP
+# MAIN LOOP  [F11: feature_csv forwarded from __main__]
 # ════════════════════════════════════════════════════════════════════════════════
 
-def run_lodo(hp: dict, selected_modes: list):
+def run_lodo(hp: dict, selected_modes: list,
+             feature_csv: str = "master_acoustic_features.csv"):
     setup_dirs()
     init_log()
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -937,6 +893,8 @@ def run_lodo(hp: dict, selected_modes: list):
     print(f"Device      : {device}")
     print(f"AMP         : {'enabled' if device.type == 'cuda' else 'disabled'}")
     print(f"Modes       : {selected_modes}")
+    print(f"Feature CSV : {feature_csv}")
+    print(f"Results     : {RESULTS_FILE}")
     print(f"LR backbone : {hp['lr_backbone']}  |  LR head : {hp['lr_head']}")
     print(f"Epochs      : {hp['epochs']} "
           f"(min={hp['min_epochs']}, patience={hp['patience']})")
@@ -945,7 +903,7 @@ def run_lodo(hp: dict, selected_modes: list):
     print(f"Loss        : CrossEntropyLoss(weight=class_weights)  [no sampler]")
     print(f"Val split   : stratified, frac={hp['val_frac']}, min=20")
 
-    meta, egemap_all, deep_all, eg_cols = load_all_data()
+    meta, egemap_all, deep_all, eg_cols = load_all_data(feature_csv=feature_csv)
     tokenizer = AutoTokenizer.from_pretrained(TOKENIZER_ID)
     tokenizer.pad_token = tokenizer.eos_token
 
@@ -1044,18 +1002,16 @@ def run_lodo(hp: dict, selected_modes: list):
                 torch.cuda.empty_cache()
 
     # ── Unified Pool ───────────────────────────────────────────────────────────
-    pool_combo = next(c for c in LODO_COMBOS if c["pool"])
+    all_ds = meta["dataset"].unique().tolist()
+
     print(f"\n{'='*72}")
     print(f"  [POOL]  5-fold CV on ALL datasets  (upper-bound reference)")
     print(f"  N total = {len(meta)}  {meta.groupby('label').size().to_dict()}")
     print(f"{'='*72}")
 
-    all_ds = meta["dataset"].unique().tolist()
-
     for mode in selected_modes:
         for seed_off in range(hp["n_seeds"]):
             seed = hp["base_seed"] + seed_off
-            # Pool is done if all target datasets have a row for this (mode, POOL, seed)
             pool_done = all(_is_done(mode, "POOL", seed, ds) for ds in all_ds)
             if pool_done:
                 print(f"  ⏩ Pool | {mode:<22} | seed={seed}")
@@ -1102,7 +1058,7 @@ def run_lodo(hp: dict, selected_modes: list):
 
 
 # ════════════════════════════════════════════════════════════════════════════════
-# ENTRY POINT
+# ENTRY POINT  [F11: --feature_csv and --run_tag added]
 # ════════════════════════════════════════════════════════════════════════════════
 
 if __name__ == "__main__":
@@ -1124,10 +1080,48 @@ if __name__ == "__main__":
     p.add_argument("--pool_folds",  type=int,   default=HPARAMS["pool_folds"])
     p.add_argument("--modes", nargs="+", default=MODES,
                    help=f"Subset of modes. Choices: {MODES}")
+    # ── Ablation support ──────────────────────────────────────────────────────
+    p.add_argument(
+        "--feature_csv",
+        type=str,
+        default="master_acoustic_features.csv",
+        help=(
+            "eGeMAPS feature CSV filename, relative to processed_data/. "
+            "Defaults to 'master_acoustic_features.csv' (baseline). "
+            "Example: --feature_csv master_acoustic_features_robust.csv"
+        ),
+    )
+    p.add_argument(
+        "--run_tag",
+        type=str,
+        default="",
+        help=(
+            "Short label appended to all four output files so baseline and "
+            "ablation runs never collide and resumption works independently. "
+            "Example: --run_tag ablation  →  lodo_results_ablation.csv"
+        ),
+    )
+    # ─────────────────────────────────────────────────────────────────────────
     args = p.parse_args()
+
+    # ── Dynamically reroute output filenames when a run_tag is given  [F11] ──
+    if args.run_tag:
+        import sys
+        suffix = f"_{args.run_tag}"
+        _mod = sys.modules[__name__]
+        _mod.RESULTS_FILE = f"lodo_results{suffix}.csv"
+        _mod.SUMMARY_FILE = f"lodo_summary{suffix}.csv"
+        _mod.REPORT_FILE  = f"lodo_report{suffix}.txt"
+        _mod.TRAIN_LOG    = os.path.join(LOG_DIR, f"training_log{suffix}.csv")
+        print(f"[config] run_tag       : '{args.run_tag}'")
+        print(f"[config] Results file  : {_mod.RESULTS_FILE}")
+        print(f"[config] Summary file  : {_mod.SUMMARY_FILE}")
+
+    print(f"[config] feature_csv   : {args.feature_csv}")
 
     hp = {k: getattr(args, k) for k in HPARAMS}
     selected = [m for m in args.modes if m in MODES]
     if not selected:
         raise ValueError(f"No valid modes. Choose from {MODES}")
-    run_lodo(hp, selected)
+
+    run_lodo(hp, selected, feature_csv=args.feature_csv)

@@ -1,73 +1,92 @@
-# --- Python Environment ---
+# ============================================================
+# Python Environment
+# ============================================================
+
 .venv/
 venv/
 env/
 mci_env/
+
 __pycache__/
 *.pyc
 *.pyo
 *.pyd
 
-# --- Datasets and Raw Files ---
+# ============================================================
+# Datasets and Audio
+# ============================================================
+
 data/
-processed_data/
 raw_data/
+processed_data/
+
 *.cha
 *.wav
 *.mp3
 *.flac
 
-# --- Model Weights and Checkpoints (Heavy Files) ---
+# ============================================================
+# Model Weights and Checkpoints
+# ============================================================
+
 trained_*/
 model_checkpoints/
+
 *.bin
 *.pth
 *.pt
-*.h5
 *.ckpt
+*.h5
 
-# --- Logs and Cluster Output ---
+# ============================================================
+# Generated Outputs / Reports
+# ============================================================
+
+xai_results/
 logs/
+
 *.log
 *.out
 *.err
 
-# --- IDE and OS Specific ---
+# Generated experiment tables / reports
+*.csv
+*.png
+
+# Keep important documentation
+!README.md
+!LICENSE
+
+# ============================================================
+# Research Artifacts
+# ============================================================
+
+severity_model/
+severity_outputs.zip
+
+# ============================================================
+# Wheels / Local Packages
+# ============================================================
+
+*.whl
+
+# ============================================================
+# IDE / OS
+# ============================================================
+
 .ipynb_checkpoints/
 .vscode/
 .idea/
+
 .DS_Store
+Thumbs.db
+
 *.swp
 *.swo
 
-# --- Ignore temporary/debug files ---
+# ============================================================
+# Temporary / Debug
+# ============================================================
+
 debug_*/
 temp_*/
-.venv/
-data/
-*.bin
-*.pt
-logs/
-__pycache__/
-.DS_Store
-xai_results/
-cross_corpus_generalization_results.csv
-logs/
-processed_data/
-trained_mamba_attention_fusion/
-__pycache__/
-*.pyc
-.venv/
-processed_data/
-xai_results/
-cross_corpus_generalization_results.csv
-asr_validation_results_v5_0.csv
-logs/
-trained_mamba_attention_fusion/
-*.wav
-*.mp3
-*.flac
-
-# Exclude model weights and bulky research artifacts
-severity_model/
-severity_outputs.zip
