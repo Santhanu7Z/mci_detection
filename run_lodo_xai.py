@@ -1,6 +1,8 @@
 """
-run_lodo_xai.py — Production Grade v4.0
-Strict artifact validation, reproducible environments, and schema-aware execution.
+run_lodo_xai.py — v4.3
+Fix: uses cpu_safe_model() from explainability_suite which replaces all
+Triton RMSNorm instances with pure-PyTorch equivalents and disables
+fused_add_norm on every Block.  No env vars needed.
 """
 
 import os
@@ -14,181 +16,174 @@ from transformers import AutoTokenizer
 from mamba_ssm.models.mixer_seq_simple import MambaLMHeadModel
 from sklearn.preprocessing import StandardScaler
 
-from explainability_suite import MambaFusionEngineDynamic, run_xai, detect_arch_flags
+from explainability_suite import (
+    MambaFusionEngineDynamic, run_xai, detect_arch_flags, cpu_safe_model
+)
 
-# ============================================================
-# DETERMINISTIC EXECUTION
-# ============================================================
 SEED = 42
 random.seed(SEED)
 np.random.seed(SEED)
 torch.manual_seed(SEED)
 
-if torch.cuda.is_available():
-    torch.cuda.manual_seed_all(SEED)
-    torch.backends.cudnn.deterministic = True
-    torch.backends.cudnn.benchmark = False
 
-DEVICE = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+# ============================================================
+# HELPERS
+# ============================================================
 
 def reconstruct_training_scaler(prep_meta):
     scaler = StandardScaler()
-    scaler.mean_ = np.array(prep_meta["scaler_mean"])
-    scaler.scale_ = np.array(prep_meta["scaler_scale"])
-    scaler.var_ = np.array(prep_meta["scaler_var"])
+    scaler.mean_          = np.array(prep_meta["scaler_mean"])
+    scaler.scale_         = np.array(prep_meta["scaler_scale"])
+    scaler.var_           = np.array(prep_meta["scaler_var"])
     scaler.n_features_in_ = len(prep_meta["scaler_mean"])
     return scaler
 
+
 def analyze_cross_seed_stability(all_word_runs, output_path):
     if len(all_word_runs) < 2:
-        print("⚠️ Not enough completed seed runs to perform cross-seed stability calculations.")
+        print("Not enough seed runs for stability analysis.")
         return
-    
-    pivoted_runs = []
+
+    pivoted = []
     for i, df_run in enumerate(all_word_runs):
         if "word" not in df_run.columns or "importance" not in df_run.columns:
             continue
         agg = df_run.groupby("word")["importance"].mean().rename(f"run_{i}")
-        pivoted_runs.append(agg)
-        
-    if not pivoted_runs:
+        pivoted.append(agg)
+
+    if not pivoted:
         return
-        
-    merged_runs = pd.concat(pivoted_runs, axis=1).fillna(0.0)
-    correlations = []
-    cols = merged_runs.columns
-    for i in range(len(cols)):
-        for j in range(i + 1, len(cols)):
-            rho, _ = spearmanr(merged_runs[cols[i]], merged_runs[cols[j]])
-            correlations.append(rho)
-            
-    stability_score = np.mean(correlations) if correlations else 1.0
+
+    merged = pd.concat(pivoted, axis=1).fillna(0.0)
+    cols   = merged.columns
+    corrs  = [spearmanr(merged[cols[i]], merged[cols[j]]).correlation
+              for i in range(len(cols)) for j in range(i+1, len(cols))]
+
+    rho = float(np.mean(corrs)) if corrs else 1.0
     os.makedirs(os.path.dirname(output_path), exist_ok=True)
     with open(output_path, "w") as f:
-        f.write(f"Systematic Explanation Stability Analysis\n")
-        f.write(f"=========================================\n")
-        f.write(f"Number of evaluated model instances: {len(all_word_runs)}\n")
-        f.write(f"Mean Inter-Run Spearman Rank Correlation (ρ): {stability_score:.4f}\n")
-    print(f"📊 Stability analysis metrics saved -> {output_path} (ρ = {stability_score:.4f})")
+        f.write("Explanation Stability Analysis\n")
+        f.write("===============================\n")
+        f.write(f"Seed runs analysed : {len(all_word_runs)}\n")
+        f.write(f"Mean Spearman rho  : {rho:.4f}\n")
+    print(f"Stability report -> {output_path}  (rho={rho:.4f})")
+
 
 # ============================================================
-# CHECKPOINT LOADING & EXECUTION
+# MAIN
 # ============================================================
+
 def main():
-    print("=============================================================")
-    print("💎 EXPLAINABILITY ENGINE: ARTIFACT REGISTRY CV PIPELINE")
-    print("=============================================================")
+    print("=" * 65)
+    print("EXPLAINABILITY ENGINE — ARTIFACT REGISTRY CV PIPELINE")
+    print("Fix v4.3: Triton RMSNorm replaced via cpu_safe_model()")
+    print("=" * 65)
 
     checkpoint_dir = "trained_mamba_attention_fusion_migrated"
     if not os.path.exists(checkpoint_dir):
-        print(f"❌ Target directory '{checkpoint_dir}' does not exist.")
+        print(f"Directory not found: {checkpoint_dir}")
         return
 
-    checkpoints = ["best_attention_fusion.bin"]
-    if not checkpoints:
-        print("❌ No checkpoint binaries located.")
-        return
-
-    # Load Base Data
+    # Load base data
     df_master = pd.read_csv("processed_data/master_metadata_cleaned.csv")
     with open("processed_data/cleaned_transcripts.json") as f:
         transcripts = json.load(f)["transcripts"]
     df_master["text"] = df_master["audio_path"].map(transcripts)
     df_master = df_master.dropna(subset=["text"])
-    df_master = df_master[df_master["label"].isin(["Control", "Dementia"])].reset_index(drop=True)
-    
+    df_master = df_master[df_master["label"].isin(["Control","Dementia"])].reset_index(drop=True)
+
     df_acoustic_raw = pd.read_csv("processed_data/master_acoustic_features.csv")
     join_col = "audio_path" if "audio_path" in df_acoustic_raw.columns else "participant_id"
 
-    global_word_importance_runs = []
+    global_word_runs = []
 
-    for ckpt_file in checkpoints:
+    for ckpt_file in ["best_attention_fusion.bin"]:
         ckpt_path = os.path.join(checkpoint_dir, ckpt_file)
-        print(f"\n🔒 Loading Experiment Artifact: {ckpt_file}")
+        print(f"\nLoading: {ckpt_file}")
 
         try:
-            experiment_bundle = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+            bundle = torch.load(ckpt_path, map_location="cpu", weights_only=False)
 
-            # --- SCHEMA VALIDATION ---
-            if not isinstance(experiment_bundle, dict):
-                print("⚠️ Invalid checkpoint structure.")
-                continue
+            if not isinstance(bundle, dict):
+                print("Invalid checkpoint structure — skipping."); continue
+            if bundle.get("schema_version", 0) < 2:
+                print("Legacy checkpoint — run migration first."); continue
 
-            schema_version = experiment_bundle.get("schema_version", 0)
-            if schema_version < 2:
-                print("⚠️ Legacy checkpoint detected. Run migration utility first.")
-                continue
-
-            required_keys = ["experiment_config", "preprocessing_metadata", "model_state_dict"]
-            missing = [k for k in required_keys if k not in experiment_bundle]
+            missing = [k for k in ["experiment_config","preprocessing_metadata","model_state_dict"]
+                       if k not in bundle]
             if missing:
-                print(f"⚠️ Missing keys: {missing}")
-                continue
+                print(f"Missing keys: {missing}"); continue
 
-            config = experiment_bundle["experiment_config"]
-            prep_meta = experiment_bundle["preprocessing_metadata"]
-            state_dict = experiment_bundle["model_state_dict"]
+            config     = bundle["experiment_config"]
+            prep_meta  = bundle["preprocessing_metadata"]
+            state_dict = bundle["model_state_dict"]
+            print(f"Schema v{bundle['schema_version']} verified.")
 
-            print(f"✅ Schema v{schema_version} artifact verified.")
-
-            # --- DOMAIN EXTRACTION ---
+            # Determine held-out domain
             target_domain = config.get("test_dataset", "unknown_domain")
-            
-            # If the checkpoint didn't specify a test domain, force it to test on TAUKADIAL
-            if target_domain.lower() in ["unknown", "unknown_domain", "global_pool", "none"]:
-                print("⚠️ Generic domain detected. Forcing zero-shot evaluation on TAUKADIAL.")
+            if target_domain.lower() in ["unknown","unknown_domain","global_pool","none"]:
+                print("Generic domain — defaulting to TAUKADIAL.")
                 target_domain = "taukadial"
-                
-            print(f"🎯 Held-out domain: {target_domain}")
+            print(f"Held-out domain: {target_domain}")
 
-            # --- FEATURE ORDER RESTORATION ---
+            # Feature order + scaler
             feature_order = prep_meta["feature_ordering"]
-            scaler = reconstruct_training_scaler(prep_meta)
-            print(f"📊 Restored {len(feature_order)} acoustic features")
+            scaler        = reconstruct_training_scaler(prep_meta)
+            print(f"Restored {len(feature_order)} acoustic features")
 
-            # --- FILTER TEST SET ---
-            df_test = df_master[df_master["dataset"].str.lower() == target_domain.lower()].reset_index(drop=True)
+            # Filter test set
+            df_test = df_master[
+                df_master["dataset"].str.lower() == target_domain.lower()
+            ].reset_index(drop=True)
             if df_test.empty:
-                print("⚠️ Empty held-out test set.")
-                continue
+                print("Empty test set — skipping."); continue
 
-            df_test = pd.merge(df_test, df_acoustic_raw[[join_col] + feature_order], on=join_col, how="inner")
+            df_test       = pd.merge(df_test,
+                                     df_acoustic_raw[[join_col] + feature_order],
+                                     on=join_col, how="inner")
             acoustic_data = scaler.transform(df_test[feature_order].values)
 
-            # --- LOAD MODEL ---
-            tokenizer = AutoTokenizer.from_pretrained(config.get("tokenizer_name", "EleutherAI/gpt-neox-20b"))
+            # Build model — load to CPU then make Triton-safe
+            tokenizer = AutoTokenizer.from_pretrained(
+                config.get("tokenizer_name", "EleutherAI/gpt-neox-20b"))
             tokenizer.pad_token = tokenizer.eos_token
-            backbone = MambaLMHeadModel.from_pretrained(config.get("backbone_name", "state-spaces/mamba-130m"))
-            flags = detect_arch_flags(state_dict)
-            
-            model = MambaFusionEngineDynamic(backbone, len(feature_order), *flags).to(DEVICE)
-            model.load_state_dict(state_dict, strict=True)
-            model.eval()
 
-            # --- EXECUTE XAI ---
+            backbone = MambaLMHeadModel.from_pretrained(
+                config.get("backbone_name", "state-spaces/mamba-130m"))
+            flags = detect_arch_flags(state_dict)
+
+            model = MambaFusionEngineDynamic(backbone, len(feature_order), *flags)
+            model.load_state_dict(state_dict, strict=True)
+            model = cpu_safe_model(model)   # ← replaces Triton norms, moves to CPU
+            print(f"Model device: {next(model.parameters()).device}")
+
+            # Run XAI
             output_dir = os.path.join("xai_results", target_domain)
             os.makedirs(output_dir, exist_ok=True)
 
-            word_importance_df = run_xai(
+            word_df = run_xai(
                 df=df_test,
                 acoustic_data=acoustic_data,
                 tokenizer=tokenizer,
                 model=model,
                 output_dir=output_dir,
                 n_samples=8,
-                )
+            )
 
-            if word_importance_df is not None and not word_importance_df.empty:
-                global_word_importance_runs.append(word_importance_df)
+            if word_df is not None and not word_df.empty:
+                global_word_runs.append(word_df)
 
         except Exception as e:
-            print(f"❌ Failed on {ckpt_file}")
-            print(f"❌ Error: {str(e)}")
+            import traceback
+            print(f"Failed on {ckpt_file}: {e}")
+            traceback.print_exc()
 
-    print("\n" + "=" * 80)
-    print("📈 AGGREGATION PARADIGM: EXPLANATION CONSISTENCY ANALYSIS")
-    print("=" * 80)
-    analyze_cross_seed_stability(global_word_importance_runs, "xai_results/systemwide_stability_report.txt")
+    print("\n" + "=" * 65)
+    print("CROSS-SEED STABILITY ANALYSIS")
+    print("=" * 65)
+    analyze_cross_seed_stability(global_word_runs,
+                                 "xai_results/systemwide_stability_report.txt")
+
 
 if __name__ == "__main__":
     main()
