@@ -167,7 +167,7 @@ def main():
                 tokenizer=tokenizer,
                 model=model,
                 output_dir=output_dir,
-                n_samples=8,
+                n_samples=200,
             )
 
             if word_df is not None and not word_df.empty:

@@ -49,7 +49,7 @@ except Exception:
 
 DEVICE = torch.device("cpu")
 torch.manual_seed(42)
-MC_SAMPLES = 5
+MC_SAMPLES = 1
 
 
 # ============================================================
